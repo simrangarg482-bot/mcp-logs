@@ -41,8 +41,20 @@ from app.database.models.tenancy_models import Project, ProjectMembership
 #: grant "everything this app currently checks," not a design each should
 #: independently decide). Not a `Settings` field: this is what "admin"
 #: *means* in this codebase today, not a deployment-time configuration.
+#:
+#: `incident:read` was missing here from 2026-08-18 (`d706a360fc2a`, which
+#: added the permission and backfilled every role that existed at the time)
+#: until this fix -- `scripts/seed_test_organization.py` was updated with it
+#: then (see its own "one exception" comment) but this list was not, so
+#: every organization's admin role created by real self-service signup in
+#: that window could write incidents but not read them. `ensure_admin_role`
+#: (core/users/service.py) re-grants this list to the single shared "admin"
+#: role on every signup, so restoring the code here self-heals every
+#: existing organization the next time anyone signs up; migration
+#: `f3e7c05b146e` grants it immediately without waiting for that.
 ADMIN_PERMISSION_CODES: Sequence[str] = (
     "tenancy:manage",
+    "incident:read",
     "incident:write",
     "postmortem:write",
     "postmortem:approve",

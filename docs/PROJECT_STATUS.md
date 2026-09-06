@@ -1744,6 +1744,85 @@ wire a real organization switcher once the frontend changes are made.
     organization per account, unchanged.
 
 
+## Phase 29 (Production incident: incidents unable to load / create, this session)
+
+**Symptom reported**: "new incident failed to create and also incidents are
+unable to load" against the deployed frontend
+(`https://frontend-production-ded3.up.railway.app/incidents/new`).
+
+**Diagnosis**: live browser automation against the deployed frontend showed
+the incidents list stuck on "Loading…" and then "Something went wrong -- We
+couldn't load this data." Instrumenting `window.fetch` on the live page
+captured the actual failing request: `GET /incidents?limit=20&offset=0` ->
+`403 {"error_code": "permission_denied", "message": "You do not have
+permission to perform this action.", "detail": {"required_permission":
+"incident:read"}}`. Session/token machinery itself was confirmed healthy
+first (a direct `POST /auth/refresh` with the browser's stored refresh
+token returned a fresh, valid access token) -- this ruled out Phase 28's
+token-type-claim change before looking further, and pointed squarely at an
+authorization/RBAC gap rather than an authentication one.
+
+**Root cause**: `app.database.migrations.versions.d706a360fc2a`
+(2026-08-18) added the `incident:read` permission, gated
+`core.incidents.service.get_incident`/`list_incidents`/`get_timeline` on it,
+and backfilled every role that existed *at that migration's run time* -- by
+its own explicit design, it does not affect roles created afterward.
+`core.users.repository.ADMIN_PERMISSION_CODES` -- the fixed list
+`core.users.service.ensure_admin_role` grants to the single shared "admin"
+role on every self-service signup -- was never updated to include
+`incident:read` (only `scripts/seed_test_organization.py`'s dev-only
+bootstrap was, per its own "one exception" comment, which named exactly
+this risk without it being carried through to the production list). Every
+organization whose admin role was created or re-granted by real signup
+after `d706a360fc2a` shipped could therefore write incidents
+(`incident:write`, which the list does have) but not read them back --
+the exact 403 observed.
+
+**Fix**:
+  - `app/core/users/repository.py` -- added `"incident:read"` to
+    `ADMIN_PERMISSION_CODES`, with a comment explaining the drift so it
+    doesn't recur silently. `ensure_admin_role` is idempotent and re-grants
+    the full list to the same shared "admin" role on every signup, so this
+    alone self-heals every affected organization the next time anyone signs
+    up anywhere.
+  - New migration `f3e7c05b146e_grant_incident_read_to_admin_role.py`
+    (`Revises: f6a7b8c9d0e1`, the Phase 28 head) grants `incident:read` to
+    the `"admin"` role immediately, via the same idempotent
+    `INSERT ... ON CONFLICT DO NOTHING` pattern `d706a360fc2a` used, scoped
+    to `r.name = 'admin'` specifically (the only role
+    `get_or_create_role_by_name` is ever called with -- confirmed by
+    grepping every call site) rather than every role, since `d706a360fc2a`
+    already covered every role that existed before it.
+  - New regression test
+    (`tests/core/users/test_admin_permission_codes.py`, 3 tests) pins
+    `incident:read` (and `incident:write`) into `ADMIN_PERMISSION_CODES`
+    directly against `core.incidents.service`'s own permission constants,
+    plus a duplicate-entry guard -- this class of gap is now caught without
+    a live database or a real signup.
+
+**Test results**: new test file 3/3 passed. Full re-run of
+`tests/{core,api,database,shared,ingestion,ingestion_retrieval,retrieval,mcp,agents}`:
+435 passed in the first, focused pass
+(`tests/{core,api,database}`); the remaining suites added 472 passed / 2
+failed / 5 errors, all seven exclusively
+`tests/shared/security/test_azure_kms.py`'s pre-existing
+`ModuleNotFoundError: No module named 'azure'` (azure-\* SDK not installed
+in this environment -- unrelated to this change, identical to every prior
+session's baseline). No test outside that one file failed. Migration head
+verified via the same regex-based script used throughout this session: 23
+total migrations, single head `f3e7c05b146e`.
+
+**Remaining limitation / action needed**: the migration has been written
+and verified (syntax, single-head, idempotency by inspection) but **has not
+been applied to the production database** -- this session has no
+production `DATABASE_URL` credentials, and applying it is a real write
+against live data, which this session's standing instructions require
+surfacing before doing. Applying
+`f3e7c05b146e_grant_incident_read_to_admin_role.py` (`alembic upgrade
+head`) against production is the one remaining step to restore incident
+reads for every organization affected today without waiting for a new
+signup to self-heal it.
+
 ## Important context to continue
 
 - Never fabricate test/verification results. Distinguish PASS (actually run, actually passed) / PARTIAL / BLOCKED (environment-limited) / FAILED honestly, always.
