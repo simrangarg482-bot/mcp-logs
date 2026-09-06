@@ -16,7 +16,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.core.exceptions import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
+from app.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+    ServiceUnavailableError,
+    ValidationError,
+)
 from app.core.tenancy import service as tenancy_service
 from app.core.tenancy.schemas import (
     ConnectorConfig,
@@ -25,7 +31,7 @@ from app.core.tenancy.schemas import (
     SSOConfigurationCreate,
 )
 from app.shared.schemas import ActorKind, Identity
-from app.shared.security import decrypt_secret, get_kms
+from app.shared.security import KmsUnavailableError, decrypt_secret, get_kms
 
 
 def _admin(organization_id: uuid.UUID) -> Identity:
@@ -93,6 +99,47 @@ async def test_register_connector_encrypts_credential_before_storing(monkeypatch
     # security-audit fix: identical sensitivity, previously inconsistent).
     assert result.credential_ref == tenancy_service._REDACTED_CREDENTIAL
     assert result.credential_ref != stored_credential_ref
+
+
+@pytest.mark.asyncio
+async def test_register_connector_translates_kms_unavailable_to_service_unavailable(
+    monkeypatch,
+) -> None:
+    """Production incident this session diagnosed: an unreachable/
+    misconfigured KMS (Azure Key Vault unreachable, or no usable
+    `DefaultAzureCredential` source -- the actual case found live) made
+    `encrypt_secret` raise a raw, untranslated exception that became an
+    unhandled 500 -- one that never passed back through `CORSMiddleware`,
+    so the browser reported it as a CORS failure rather than a real error,
+    for every connector source (GitHub, Slack, ...) identically, since they
+    all share this one call site.
+
+    `KmsUnavailableError` (`app.shared.security.kms`) is what
+    `AzureKeyVaultKeyManagementService` now raises instead of a bare Azure
+    SDK exception (see `tests/shared/security/test_azure_kms.py`); this
+    pins the other half of the fix -- `register_connector` catching it and
+    raising an ordinary `ServiceUnavailableError` (503), which the existing
+    `EKIPError` handler renders as a normal, CORS-visible JSON error like
+    any other domain error.
+    """
+    organization_id = uuid.uuid4()
+    actor = _admin(organization_id)
+
+    async def fake_encrypt_secret(kms, plaintext):
+        raise KmsUnavailableError("Azure Key Vault is unreachable.")
+
+    monkeypatch.setattr(tenancy_service, "encrypt_secret", fake_encrypt_secret)
+
+    with pytest.raises(ServiceUnavailableError) as exc_info:
+        await tenancy_service.register_connector(
+            None,
+            actor,
+            organization_id,
+            ConnectorConfigCreate(source="github", credential_ref="ghp_fake"),
+        )
+
+    assert exc_info.value.error_code == "connector_config.kms_unavailable"
+    assert isinstance(exc_info.value.__cause__, KmsUnavailableError)
 
 
 def test_connector_redaction_removes_worker_owned_config_state() -> None:
@@ -957,6 +1004,48 @@ async def test_configure_sso_encrypts_client_secret_before_storing(monkeypatch) 
     # nothing that ever touched a real (or fake) secret crosses the wire.
     assert result.client_secret_ref == tenancy_service._REDACTED_CLIENT_SECRET
     assert result.client_secret_ref != stored_client_secret_ref
+
+
+@pytest.mark.asyncio
+async def test_configure_sso_translates_kms_unavailable_to_service_unavailable(monkeypatch) -> None:
+    """Same production incident and same fix as
+    `test_register_connector_translates_kms_unavailable_to_service_unavailable`
+    -- `configure_sso` shares the exact same `encrypt_secret(get_kms(), ...)`
+    call and was reproduced live failing identically (verified directly
+    against production during this session's investigation: both endpoints
+    returned the same unhandled 500 with no CORS headers).
+    """
+    organization_id = uuid.uuid4()
+    actor = _admin(organization_id)
+
+    async def fake_get_sso_configuration_by_organization_id(session, org_id):
+        return None
+
+    async def fake_encrypt_secret(kms, plaintext):
+        raise KmsUnavailableError("Azure Key Vault is unreachable.")
+
+    monkeypatch.setattr(
+        tenancy_service.repository,
+        "get_sso_configuration_by_organization_id",
+        fake_get_sso_configuration_by_organization_id,
+    )
+    monkeypatch.setattr(tenancy_service, "encrypt_secret", fake_encrypt_secret)
+
+    with pytest.raises(ServiceUnavailableError) as exc_info:
+        await tenancy_service.configure_sso(
+            None,
+            actor,
+            organization_id,
+            SSOConfigurationCreate(
+                provider="okta",
+                issuer_url="https://example.okta.com",
+                client_id="client-123",
+                client_secret_ref="super-secret",
+            ),
+        )
+
+    assert exc_info.value.error_code == "sso_configuration.kms_unavailable"
+    assert isinstance(exc_info.value.__cause__, KmsUnavailableError)
 
 
 @pytest.mark.asyncio

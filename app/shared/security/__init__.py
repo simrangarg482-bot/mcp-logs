@@ -34,11 +34,17 @@ shared by multiple configs) becomes concrete.
 from __future__ import annotations
 
 from app.shared.security.envelope import decrypt_secret, encrypt_secret
-from app.shared.security.kms import KeyManagementService, LocalKeyManagementService, get_kms
+from app.shared.security.kms import (
+    KeyManagementService,
+    KmsUnavailableError,
+    LocalKeyManagementService,
+    get_kms,
+)
 from app.shared.security.tokens import generate_opaque_token, hash_opaque_token
 
 __all__ = [
     "KeyManagementService",
+    "KmsUnavailableError",
     "LocalKeyManagementService",
     "decrypt_secret",
     "encrypt_secret",

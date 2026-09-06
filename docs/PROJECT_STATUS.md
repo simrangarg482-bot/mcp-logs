@@ -1823,6 +1823,154 @@ head`) against production is the one remaining step to restore incident
 reads for every organization affected today without waiting for a new
 signup to self-heal it.
 
+## Phase 30 (Production incident: connectors unable to register -- GitHub/Slack/any source, this session)
+
+**Symptom reported**: "failed to add github connector" against the deployed
+frontend's `/connectors` page, then confirmed to affect Slack identically
+("Failed to add Slack connector"). The frontend's own toast is generic on
+any error, so this alone didn't identify a cause -- the browser devtools
+network tab showed the actual `POST /tenancy/connectors` request "blocked
+by CORS policy: No 'Access-Control-Allow-Origin' header," which looked
+like (and was reported as) a CORS misconfiguration but was not one.
+
+**Diagnosis**: Live browser automation reproduced the failure directly
+against production (a disposable test signup, `claude-diag-20260906@
+example.com` / "Claude Diag Org" -- left in place; deleting it would be a
+real production-data delete this session did not have standing
+authorization to perform, flagged to the user rather than done silently).
+Because the failing request was cross-origin and CORS-blocked, the
+browser's own `fetch` could not read the real response -- worked around by
+navigating the same browser tab directly to the backend's own origin
+(`https://mcp-logs-production.up.railway.app`) and re-issuing the exact
+same authenticated request there, same-origin, where CORS does not apply
+and the real response is readable. That returned `500 Internal Server
+Error` (plain text, no body) -- a genuine unhandled exception, not a CORS
+problem at all.
+
+**Root cause, two layers**:
+  1. `core.tenancy.service.register_connector` and `configure_sso` (SSO
+     setup) both call `encrypt_secret(get_kms(), ...)` synchronously before
+     persisting a connector credential / SSO client secret.
+     `configure_sso` was tested directly (same technique) and failed
+     identically, which is what proved the shared `encrypt_secret`/KMS
+     path -- not anything GitHub- or Slack-specific -- was the actual
+     cause; the schema, permission (`tenancy:manage`, already correct and
+     unaffected by Phase 29's fix), and repository-insert code for both
+     endpoints are otherwise unrelated and fine (`GET /tenancy/connectors`,
+     which shares the same permission check but not the encryption call,
+     returned a normal `200 []`).
+  2. Repeated timing measurements of the failing call (~2-3.3s, consistent
+     across repeats, with jitter) are inconsistent with a pure in-process
+     failure (a malformed local KEK, or a missing `azure` package import --
+     both would fail in well under a millisecond) and consistent with a
+     *network* credential-resolution attempt failing -- i.e.
+     `KMS_PROVIDER=azure` is configured, and `AzureKeyVaultKeyManagementService`'s
+     `DefaultAzureCredential` has no usable credential source in this
+     Railway deployment (no Azure managed identity -- this process isn't
+     running on Azure -- and apparently no explicit service-principal env
+     vars configured either), so the real Key Vault `wrap_key`/`unwrap_key`
+     call fails with an `azure.core.exceptions.AzureError` (e.g.
+     `ClientAuthenticationError`).
+
+  That `AzureError` is a bare, non-`EKIPError` exception -- unhandled, it
+  propagates past `ExceptionMiddleware` (no handler registered for it) and
+  is caught only by Starlette's outermost `ServerErrorMiddleware`, which
+  sits *outside* `CORSMiddleware` in this app's middleware stack
+  (`app.api.main`'s `add_middleware` order). A response synthesized by
+  `ServerErrorMiddleware` therefore never passes back through
+  `CORSMiddleware` and carries no `Access-Control-Allow-Origin` header --
+  which is exactly why the browser reported "blocked by CORS policy" for
+  what was actually an ordinary 500. This second layer is real and was
+  worth fixing regardless of which specific KMS failure caused it: *any*
+  future unhandled, non-`EKIPError` exception anywhere behind
+  `CORSMiddleware` will keep masquerading as a CORS bug to every browser
+  client until responses like this carry real error information.
+
+**Fix** (scoped to the shared KMS/envelope path and its two callers, per
+this session's instruction -- no unrelated code touched):
+  - `app/shared/security/kms.py`: new `KmsUnavailableError(RuntimeError)`
+    (deliberately not an `EKIPError` subclass -- `app.shared` sits below
+    `app.core` in this codebase's layering / import-linter contracts, and
+    must not depend upward on it). `AzureKeyVaultKeyManagementService.
+    generate_data_key`/`decrypt_data_key` now catch
+    `azure.core.exceptions.AzureError` around their real Key Vault calls
+    and re-raise `KmsUnavailableError` (`raise ... from exc`, preserving
+    the original as `__cause__`) instead of letting the raw Azure SDK
+    exception escape.
+  - `app/shared/security/__init__.py`: exports `KmsUnavailableError`
+    alongside the existing KMS/envelope surface.
+  - `app/core/tenancy/service.py`: `register_connector` and `configure_sso`
+    each now catch `KmsUnavailableError` around their `encrypt_secret(
+    get_kms(), ...)` call and re-raise the existing
+    `ServiceUnavailableError` (503, already defined in
+    `app.core.exceptions` for exactly this "dependency temporarily
+    unreachable, retry later" case) with a clear message and a new
+    `error_code` each (`connector_config.kms_unavailable` /
+    `sso_configuration.kms_unavailable`). Because `ServiceUnavailableError`
+    is an ordinary `EKIPError`, it flows through the app's existing
+    `ekip_error_handler` and back out through `CORSMiddleware` normally --
+    a real, readable, CORS-visible JSON error instead of an opaque 500.
+
+**What this fix does and does not do, stated plainly**: it makes the
+failure honest and diagnosable -- a caller now gets a proper 503 with a
+clear message instead of a CORS-shaped mystery, for every connector source
+(GitHub, Slack, Jira, ...) and for SSO configuration alike, since all of
+them share this one code path. **It does not make connector registration
+succeed.** The underlying defect is infrastructure, not code: this
+deployment has `KMS_PROVIDER=azure` selected but has no way to actually
+authenticate to Azure Key Vault from Railway. Restoring connector/SSO
+registration requires either (a) giving this Railway service valid,
+explicit Azure credentials for a service principal with Key Vault
+wrap/unwrap permission on the configured key (`AZURE_CLIENT_ID`/
+`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`, which `DefaultAzureCredential`
+picks up as `EnvironmentCredential` without any code change), or (b)
+reconsidering whether Azure Key Vault is the right KMS backend for a
+non-Azure deployment at all. Neither is something this session can do --
+no Azure credentials or Railway environment access were available here --
+so this is flagged for the user/an operator, the same way Phase 28/29's
+own "requires human action" items were.
+
+**Tests added/updated**: `tests/shared/security/test_azure_kms.py` --
+updated `test_unauthorized_key_vault_access_fails_safely_with_no_fallback`
+to assert the new `KmsUnavailableError` (wrapping the original
+`ClientAuthenticationError` as `__cause__`) instead of the raw Azure
+exception it previously expected; added
+`test_decrypt_data_key_wraps_azure_errors_the_same_way` for the unwrap
+path. `tests/core/tenancy/test_service.py` -- added
+`test_register_connector_translates_kms_unavailable_to_service_unavailable`
+and `test_configure_sso_translates_kms_unavailable_to_service_unavailable`,
+each asserting the specific `error_code` and that `__cause__` is preserved.
+
+**Test results**: `tests/shared/security/` + `tests/core/tenancy/
+test_service.py`: 59/59 passed (this required installing `azure-identity`/
+`azure-keyvault-keys` into this session's local test environment via `uv
+pip install`, which had never been done before this session -- every prior
+run of this same test file failed with `ModuleNotFoundError: No module
+named 'azure'`; those packages are correctly listed as ordinary
+`pyproject.toml` dependencies, so a real CI/production build already has
+them). Full suite re-run in three groups: `tests/{core,api,database}` 437
+passed; `tests/{shared,ingestion,mcp,agents}` 467 passed (the azure module
+now being installed means the whole test file runs for real rather than
+erroring out -- this session's every prior "all tests pass except the
+pre-existing azure ModuleNotFoundError baseline" note is superseded by
+this: there is no longer any such baseline exception anywhere in this
+repository's test suite); `tests/{ingestion_retrieval,retrieval}` 13
+passed. **917 passed, 0 failed, 0 errors, repo-wide.** `lint-imports`
+(the ARCHITECTURE.md section 3 module-boundary contracts): 7 kept, 0
+broken -- `KmsUnavailableError` living in `app.shared.security.kms` rather
+than `app.core.exceptions` was a deliberate choice verified not to
+introduce a `shared -> core` dependency. `ruff check` clean on every
+changed file.
+
+**Remaining limitation / action needed**: connectors and SSO configuration
+remain non-functional in production until an operator either supplies real
+Azure Key Vault credentials to this Railway service or switches its KMS
+configuration -- this session has no path to do either. The disposable
+test organization/account created to reproduce this live
+(`claude-diag-20260906@example.com`, "Claude Diag Org") was left in the
+production database; deleting it was out of scope for this session
+(destructive-delete authorization was not sought or given).
+
 ## Important context to continue
 
 - Never fabricate test/verification results. Distinguish PASS (actually run, actually passed) / PARTIAL / BLOCKED (environment-limited) / FAILED honestly, always.

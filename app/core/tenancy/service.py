@@ -39,7 +39,13 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit.service import record_audit_event
-from app.core.exceptions import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
+from app.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+    ServiceUnavailableError,
+    ValidationError,
+)
 from app.core.tenancy import repository
 from app.core.tenancy.schemas import (
     AccessRule,
@@ -63,7 +69,13 @@ from app.core.users.service import require_permission, require_project_permissio
 from app.database.session import set_tenant_context
 from app.shared.config.logging import get_logger
 from app.shared.schemas import Identity
-from app.shared.security import encrypt_secret, generate_opaque_token, get_kms, hash_opaque_token
+from app.shared.security import (
+    KmsUnavailableError,
+    encrypt_secret,
+    generate_opaque_token,
+    get_kms,
+    hash_opaque_token,
+)
 
 logger = get_logger(__name__)
 
@@ -349,7 +361,19 @@ async def configure_sso(
             detail={"organization_id": str(organization_id)},
         )
 
-    encrypted_client_secret_ref = await encrypt_secret(get_kms(), data.client_secret_ref)
+    try:
+        encrypted_client_secret_ref = await encrypt_secret(get_kms(), data.client_secret_ref)
+    except KmsUnavailableError as exc:
+        # Same translation as `register_connector` above -- this call site
+        # shares the exact same `encrypt_secret(get_kms(), ...)` dependency
+        # and was failing identically (verified directly against production:
+        # both reproduced the same unhandled-500-with-no-CORS-headers symptom).
+        raise ServiceUnavailableError(
+            "The SSO client secret cannot be stored right now -- the key "
+            "management service is unreachable or misconfigured. Try again "
+            "shortly; if this persists, it needs operator attention.",
+            error_code="sso_configuration.kms_unavailable",
+        ) from exc
     row = await repository.insert_sso_configuration(
         session,
         organization_id=organization_id,
@@ -505,7 +529,20 @@ async def register_connector(
     else:
         require_permission(actor, _MANAGE_PERMISSION)
 
-    encrypted_credential_ref = await encrypt_secret(get_kms(), data.credential_ref)
+    try:
+        encrypted_credential_ref = await encrypt_secret(get_kms(), data.credential_ref)
+    except KmsUnavailableError as exc:
+        # See `KmsUnavailableError`'s own docstring: without this translation
+        # an unreachable/misconfigured KMS surfaced as a bare, unhandled 500
+        # that never passed back through `CORSMiddleware` -- indistinguishable,
+        # in a browser, from a CORS failure (this is exactly what "adding a
+        # connector" was doing before this fix, for every source, not just one).
+        raise ServiceUnavailableError(
+            "Connector credentials cannot be stored right now -- the key "
+            "management service is unreachable or misconfigured. Try again "
+            "shortly; if this persists, it needs operator attention.",
+            error_code="connector_config.kms_unavailable",
+        ) from exc
     row = await repository.insert_connector_config(
         session,
         organization_id=organization_id,

@@ -174,11 +174,30 @@ class AzureKeyVaultKeyManagementService:
         self._credential = credential
 
     async def generate_data_key(self) -> tuple[bytes, bytes, str]:
+        from azure.core.exceptions import AzureError
         from azure.keyvault.keys.crypto import KeyWrapAlgorithm
 
         dek = os.urandom(_DEK_SIZE_BYTES)
-        async with self._build_crypto_client(self._key_id) as crypto_client:
-            result = await crypto_client.wrap_key(KeyWrapAlgorithm.rsa_oaep_256, dek)
+        try:
+            async with self._build_crypto_client(self._key_id) as crypto_client:
+                result = await crypto_client.wrap_key(KeyWrapAlgorithm.rsa_oaep_256, dek)
+        except AzureError as exc:
+            # Any Key Vault network/auth failure (unreachable vault, no valid
+            # `DefaultAzureCredential` source available -- e.g. this process
+            # is not actually running on Azure and has no explicit service
+            # principal configured) lands here. Re-raised as `KmsUnavailableError`
+            # rather than left as a raw Azure SDK exception so callers that
+            # only import this module (not the Azure SDK) can catch it by
+            # name, and so it never reaches the API boundary as an opaque,
+            # untranslated 500 (see that class's own docstring for why this
+            # matters -- it was previously indistinguishable from a CORS
+            # failure to the browser, since an unhandled exception here
+            # never passes back through `CORSMiddleware`).
+            raise KmsUnavailableError(
+                "Azure Key Vault is unreachable or this process could not "
+                "authenticate to it (DefaultAzureCredential found no usable "
+                "credential source)."
+            ) from exc
         if not result.key_id:
             raise RuntimeError(
                 "Azure Key Vault wrap_key returned no key_id -- cannot record which "
@@ -187,6 +206,7 @@ class AzureKeyVaultKeyManagementService:
         return dek, result.encrypted_key, result.key_id
 
     async def decrypt_data_key(self, encrypted_dek: bytes, key_version: str | None) -> bytes:
+        from azure.core.exceptions import AzureError
         from azure.keyvault.keys.crypto import KeyWrapAlgorithm
 
         if not key_version:
@@ -199,14 +219,51 @@ class AzureKeyVaultKeyManagementService:
         # pinning to that exact version even if the vault's current version
         # has since rotated forward (PROJECT_PLAN.md's key-rotation
         # requirement: old ciphertext must remain decryptable).
-        async with self._build_crypto_client(key_version) as crypto_client:
-            result = await crypto_client.unwrap_key(KeyWrapAlgorithm.rsa_oaep_256, encrypted_dek)
+        try:
+            async with self._build_crypto_client(key_version) as crypto_client:
+                result = await crypto_client.unwrap_key(
+                    KeyWrapAlgorithm.rsa_oaep_256, encrypted_dek
+                )
+        except AzureError as exc:
+            # Same translation as `generate_data_key` above -- see that
+            # branch's comment for why this must not reach a caller as a
+            # raw, untranslated Azure SDK exception.
+            raise KmsUnavailableError(
+                "Azure Key Vault is unreachable or this process could not "
+                "authenticate to it (DefaultAzureCredential found no usable "
+                "credential source)."
+            ) from exc
         return result.key
 
     def _build_crypto_client(self, key_id: str):
         from azure.keyvault.keys.crypto.aio import CryptographyClient
 
         return CryptographyClient(key_id, self._credential)
+
+
+class KmsUnavailableError(RuntimeError):
+    """Raised when a real KMS backend (currently: Azure Key Vault) cannot
+    complete a wrap/unwrap operation for a reason that has nothing to do
+    with the caller's request -- the vault is unreachable, or this process
+    has no credential `DefaultAzureCredential` can use (no managed identity,
+    no service-principal env vars; the common case for a deployment that
+    isn't actually running on Azure infrastructure).
+
+    Deliberately a plain `RuntimeError`, not `app.core.exceptions.EKIPError`:
+    this module sits below `app.core` (every `app.core` service is free to
+    import `app.shared.security`, never the other way around -- see
+    ARCHITECTURE.md section 3 / this repo's import-linter contracts), so it
+    cannot depend on `core`'s exception hierarchy without inverting that
+    layering. Callers in `app.core` (e.g. `core.tenancy.service.
+    register_connector`/`configure_sso`) catch this and re-raise as their
+    own `ServiceUnavailableError` -- the same translation-at-the-boundary
+    pattern `EKIPError`'s own docstring already describes for REST/MCP, just
+    one layer further down. Letting this (or the raw Azure SDK exception it
+    replaces) propagate unhandled is exactly the bug this type exists to
+    close: an un-translated exception here reaches FastAPI's `ServerErrorMiddleware`
+    as a bare 500 that never passes back through `CORSMiddleware`, which is
+    indistinguishable, in a browser, from a CORS failure -- not a real one.
+    """
 
 
 class LocalKmsRequiredInProductionError(RuntimeError):

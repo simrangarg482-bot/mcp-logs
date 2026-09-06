@@ -18,7 +18,7 @@ import uuid
 
 import pytest
 
-from app.shared.security.kms import AzureKeyVaultKeyManagementService
+from app.shared.security.kms import AzureKeyVaultKeyManagementService, KmsUnavailableError
 
 
 class _FakeWrapResult:
@@ -166,6 +166,19 @@ async def test_unauthorized_key_vault_access_fails_safely_with_no_fallback(monke
     once `kms_provider=azure` is selected (see that function's own
     docstring), so there is no fallback path for this class to accidentally
     take even if it wanted to.
+
+    It must still raise, but as of the connector-registration/SSO-configure
+    production incident this session diagnosed and fixed, the *type* it
+    raises changed: a bare `azure.core.exceptions.AzureError` (of which
+    `ClientAuthenticationError` is one) reaching a caller unhandled becomes
+    an unhandled 500 at the API boundary that never passes back through
+    `CORSMiddleware` -- indistinguishable, in a browser, from a CORS
+    failure, which is exactly what made this bug so hard to diagnose live.
+    `generate_data_key`/`decrypt_data_key` now catch `AzureError` and
+    re-raise `KmsUnavailableError` instead, which `core.tenancy.service.
+    register_connector`/`configure_sso` in turn catch and translate to a
+    normal `ServiceUnavailableError` (503) -- see
+    `tests/core/tenancy/test_service.py`'s coverage of that translation.
     """
     from azure.core.exceptions import ClientAuthenticationError
 
@@ -178,8 +191,31 @@ async def test_unauthorized_key_vault_access_fails_safely_with_no_fallback(monke
         vault_url="https://ekip-test.vault.azure.net", key_name="k", credential=object()
     )
 
-    with pytest.raises(ClientAuthenticationError):
+    with pytest.raises(KmsUnavailableError) as exc_info:
         await kms.generate_data_key()
+    assert isinstance(exc_info.value.__cause__, ClientAuthenticationError)
+
+
+@pytest.mark.asyncio
+async def test_decrypt_data_key_wraps_azure_errors_the_same_way(monkeypatch) -> None:
+    """`decrypt_data_key` shares the exact same failure mode as
+    `generate_data_key` (both make a real Key Vault call) -- this pins the
+    same translation on the unwrap path, not just wrap.
+    """
+    from azure.core.exceptions import ServiceRequestError
+
+    class _UnreachableClient(_FakeCryptographyClient):
+        async def unwrap_key(self, algorithm, encrypted_key: bytes):
+            raise ServiceRequestError(message="Could not connect to the vault endpoint")
+
+    monkeypatch.setattr("azure.keyvault.keys.crypto.aio.CryptographyClient", _UnreachableClient)
+    kms = AzureKeyVaultKeyManagementService(
+        vault_url="https://ekip-test.vault.azure.net", key_name="k", credential=object()
+    )
+
+    with pytest.raises(KmsUnavailableError) as exc_info:
+        await kms.decrypt_data_key(b"whatever", "https://ekip-test.vault.azure.net/keys/k/v1")
+    assert isinstance(exc_info.value.__cause__, ServiceRequestError)
 
 
 @pytest.mark.asyncio
