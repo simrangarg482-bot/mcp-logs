@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -77,10 +77,21 @@ class SessionTokens(BaseModel):
     `verify_access_token`, and used identically by the REST API and MCP per
     section 7.4); `refresh_token` is the longer-lived credential used to
     obtain a new `access_token` without repeating the full SSO round trip.
+
+    `status` is additive, for the multi-organization login design gap fix:
+    `POST /auth/login` used to always return exactly this shape, so a
+    literal, defaulted `"complete"` here keeps every existing caller working
+    unchanged (they simply never look at a field they didn't know existed)
+    while letting the endpoint's response type become
+    `SessionTokens | OrganizationSelectionRequired` -- a multi-organization
+    user gets the latter instead of silently receiving a token for whichever
+    organization happened to come back first. `Field(discriminator="status")`
+    on that union is what lets FastAPI/Pydantic tell the two apart cleanly.
     """
 
     model_config = ConfigDict(frozen=True)
 
+    status: Literal["complete"] = "complete"
     access_token: str
     refresh_token: str
     token_type: Literal["bearer"] = "bearer"
@@ -116,6 +127,96 @@ class LoginRequest(BaseModel):
 
     email: str
     password: str
+
+
+class OrganizationSummary(BaseModel):
+    """The minimal, non-sensitive shape of an organization a person can pick
+    from -- used both by the multi-organization login flow and by
+    `GET /auth/organizations`. Deliberately smaller than
+    `core.tenancy.schemas.OrganizationRead`: this is what a user chooses
+    between at login time, not an admin-facing organization record.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: uuid.UUID
+    name: str
+    slug: str
+
+
+class OrganizationSelectionRequired(BaseModel):
+    """Returned by `login_with_password` instead of `SessionTokens` when the
+    authenticated user belongs to more than one organization -- the whole
+    point of this design-gap fix: password authentication having succeeded
+    no longer implies an organization has been chosen, so no access token is
+    issued yet.
+
+    `selection_token` is a short-lived, single-purpose token (see
+    `_issue_org_selection_token`/`verify_org_selection_token`) that proves
+    the password check already succeeded for a specific `user_id`, without
+    itself granting access to anything -- `POST /auth/select-organization`
+    exchanges it plus a chosen `organization_id` for a real `SessionTokens`,
+    but only after re-verifying that `user_id` actually belongs to that
+    organization. It is NOT an access token and `verify_access_token` will
+    not accept it (see that function's `"type"` claim check).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["organization_selection_required"] = "organization_selection_required"
+    selection_token: str
+    organizations: tuple[OrganizationSummary, ...]
+
+
+class OrganizationSelectionRequest(BaseModel):
+    """Input to `POST /auth/select-organization` -- the second step of a
+    multi-organization login, exchanging the `selection_token` an
+    `OrganizationSelectionRequired` response carried plus the user's chosen
+    `organization_id` for a real `SessionTokens`. The backend re-verifies
+    user-to-organization membership itself; `organization_id` here is a
+    request, never a trusted assertion.
+    """
+
+    selection_token: str
+    organization_id: uuid.UUID
+
+
+class SwitchOrganizationRequest(BaseModel):
+    """Input to `POST /auth/switch-organization` -- for an already
+    authenticated user (a valid access token, any organization) asking to
+    be re-scoped to a different organization they also belong to.
+
+    Per the security requirement this flow exists to satisfy: the backend
+    authenticates the caller from their *existing* access token, then
+    independently verifies caller-to-`organization_id` membership before
+    issuing anything -- this request's `organization_id` is never written
+    directly into a token.
+    """
+
+    organization_id: uuid.UUID
+
+
+class OrganizationsListResponse(BaseModel):
+    """Response for `GET /auth/organizations` -- every organization the
+    *currently authenticated* caller belongs to (derived from their verified
+    identity, never from a client-supplied user id), for building an
+    organization switcher in the frontend.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    organizations: tuple[OrganizationSummary, ...]
+
+
+LoginResponse = Annotated[
+    Union[SessionTokens, OrganizationSelectionRequired], Field(discriminator="status")
+]
+"""`POST /auth/login`'s actual response type: `SessionTokens` for a
+single-organization user (unchanged, existing behavior) or
+`OrganizationSelectionRequired` for a multi-organization one. The
+`discriminator="status"` tells FastAPI/Pydantic which of the two a given
+response body is without guessing from shape.
+"""
 
 
 class LogoutAllResponse(BaseModel):

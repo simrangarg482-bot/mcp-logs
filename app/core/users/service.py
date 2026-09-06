@@ -40,6 +40,7 @@ Design notes:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -345,6 +346,22 @@ async def resolve_organization_for_login(session: AsyncSession, user_id: uuid.UU
     one-organization-per-password-account scope this reflects.
     """
     return await repository.get_first_organization_id(session, user_id)
+
+
+async def list_organizations_for_login(session: AsyncSession, user_id: uuid.UUID) -> Sequence[uuid.UUID]:
+    """Return every organization `user_id` holds a role in, so
+    `core.auth.service.login_with_password` can tell "exactly one" apart
+    from "more than one" and require explicit organization selection in the
+    latter case, instead of silently picking one via
+    `resolve_organization_for_login`/`get_first_organization_id` (both left
+    unchanged -- this is a new, additive sibling, not a replacement).
+
+    Empty means the user holds no role assignment anywhere -- the same case
+    `resolve_organization_for_login` represents as `None`, just spelled as an
+    empty sequence here since "zero of many" is the natural empty case for a
+    listing rather than a special sentinel.
+    """
+    return await repository.list_organization_ids(session, user_id)
 
 
 _ADMIN_ROLE_NAME = "admin"

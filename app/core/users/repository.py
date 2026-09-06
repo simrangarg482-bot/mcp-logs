@@ -311,6 +311,33 @@ async def get_first_organization_id(session: AsyncSession, user_id: uuid.UUID) -
     return result.scalar_one_or_none()
 
 
+async def list_organization_ids(session: AsyncSession, user_id: uuid.UUID) -> Sequence[uuid.UUID]:
+    """Return every organization `user_id` holds a role in (possibly empty).
+
+    The generalized sibling of `get_first_organization_id` above, added for
+    the multi-organization login/session design gap (`f6a7b8c9d0e1_list_
+    user_organizations_function.py`): a password login needs to tell
+    "exactly one organization" apart from "more than one" *before* deciding
+    whether to log the user straight in or require them to pick, which
+    `get_first_organization_id`'s `LIMIT 1`-shaped result can't answer by
+    itself. Deliberately does NOT replace or change `get_first_organization_id`
+    -- both remain, each used where its own shape is what's needed.
+
+    Same RLS bootstrap problem as `get_first_organization_id` (no tenant
+    context can exist yet at this point in the flow, and `user_roles` is
+    `FORCE ROW LEVEL SECURITY`), so this goes through the equally narrow
+    `list_user_organization_ids` SQL function rather than a plain ORM query
+    against `UserRole`, mirroring `app.ingestion.repository.
+    list_active_connector_config_ids`'s exact multi-row bypass-function
+    pattern.
+    """
+    result = await session.execute(
+        text("SELECT organization_id FROM list_user_organization_ids(:user_id)"),
+        {"user_id": str(user_id)},
+    )
+    return result.scalars().all()
+
+
 async def get_or_create_permissions(session: AsyncSession, codes: Sequence[str]) -> list[Permission]:
     """Fetch existing `Permission` rows for `codes`, inserting any missing
     ones -- the same "populate the fixed catalog if it isn't there yet"

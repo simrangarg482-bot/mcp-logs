@@ -63,11 +63,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import repository
 from app.core.auth.schemas import (
     LoginRequest,
+    LoginResponse,
+    OrganizationSelectionRequest,
+    OrganizationSelectionRequired,
+    OrganizationsListResponse,
+    OrganizationSummary,
     RefreshRequest,
     SessionTokens,
     SignupRequest,
     SSOAuthorizationRedirect,
     SSOCallbackRequest,
+    SwitchOrganizationRequest,
     TokenClaims,
     VerifiedIdPClaims,
 )
@@ -373,7 +379,7 @@ async def signup(session: AsyncSession, data: SignupRequest) -> SessionTokens:
     return tokens
 
 
-async def login_with_password(session: AsyncSession, data: LoginRequest) -> SessionTokens:
+async def login_with_password(session: AsyncSession, data: LoginRequest) -> LoginResponse:
     """Authenticate with an email + password (`signup`'s counterpart).
 
     A wrong password and an unknown/SSO-only (no password set) email both
@@ -382,6 +388,22 @@ async def login_with_password(session: AsyncSession, data: LoginRequest) -> Sess
     account. `CryptContext.verify` itself is timing-safe; the branches above
     it are not constant-time relative to each other, but neither leaks
     anything beyond "invalid," which is the only fact either branch reveals.
+
+    Multi-organization design-gap fix (previously: silently logged into
+    whichever organization `resolve_organization_for_login`/
+    `get_first_organization_id` happened to return -- both left completely
+    unchanged; this now uses the new, additive `list_organizations_for_login`
+    instead so it can actually tell "exactly one" apart from "more than
+    one"):
+      - Zero organizations: unchanged behavior, `auth.no_organization`.
+      - Exactly one: unchanged behavior, log straight in with that
+        organization -- a single-organization user notices nothing different.
+      - More than one: does NOT pick one. Returns
+        `OrganizationSelectionRequired` instead of `SessionTokens` -- no
+        access token is issued yet, only a short-lived `selection_token`
+        that proves this password check already succeeded. The caller must
+        then call `select_organization` with a chosen organization_id, which
+        independently re-verifies membership before issuing real tokens.
     """
     lookup = await users_service.get_credential_lookup(session, data.email)
     if (
@@ -397,22 +419,38 @@ async def login_with_password(session: AsyncSession, data: LoginRequest) -> Sess
             "This account is inactive.", error_code="user.inactive"
         )
 
-    organization_id = await users_service.resolve_organization_for_login(session, lookup.user_id)
-    if organization_id is None:
+    organization_ids = await users_service.list_organizations_for_login(session, lookup.user_id)
+    if len(organization_ids) == 0:
         raise PermissionDeniedError(
             "This account is not a member of any organization.",
             error_code="auth.no_organization",
         )
 
-    tokens = await _issue_session(
-        session, user_id=lookup.user_id, organization_id=organization_id, family_id=uuid.uuid4()
-    )
+    if len(organization_ids) == 1:
+        organization_id = organization_ids[0]
+        tokens = await _issue_session(
+            session, user_id=lookup.user_id, organization_id=organization_id, family_id=uuid.uuid4()
+        )
+        logger.info(
+            "password_login_completed",
+            user_id=str(lookup.user_id),
+            organization_id=str(organization_id),
+        )
+        return tokens
+
+    selection_token, _selection_expires_at = _issue_org_selection_token(lookup.user_id)
+    organizations = await tenancy_repository.get_organizations_by_ids(session, organization_ids)
     logger.info(
-        "password_login_completed",
+        "password_login_organization_selection_required",
         user_id=str(lookup.user_id),
-        organization_id=str(organization_id),
+        organization_count=len(organizations),
     )
-    return tokens
+    return OrganizationSelectionRequired(
+        selection_token=selection_token,
+        organizations=tuple(
+            OrganizationSummary(id=org.id, name=org.name, slug=org.slug) for org in organizations
+        ),
+    )
 
 
 async def accept_invitation_with_password(
@@ -706,18 +744,92 @@ def _hash_token(raw_token: str) -> str:
 
 
 def _issue_access_token(user_id: uuid.UUID, organization_id: uuid.UUID) -> tuple[str, datetime, datetime]:
-    """Sign a new access token, returning (token, issued_at, expires_at)."""
+    """Sign a new access token, returning (token, issued_at, expires_at).
+
+    `"type": "access"` is new, additive: it lets `verify_access_token`
+    reject a well-signed-but-wrong-kind-of token (specifically, an
+    org-selection token from `_issue_org_selection_token` below) instead of
+    accepting anything bearing a valid signature regardless of what it was
+    actually issued for -- the two token kinds share the same signing key,
+    so the claim is what tells them apart.
+    """
     settings = get_settings()
     issued_at = datetime.now(timezone.utc)
     expires_at = issued_at + timedelta(minutes=settings.jwt_expiry_minutes)
     claims = {
         "sub": str(user_id),
         "organization_id": str(organization_id),
+        "type": "access",
         "iat": int(issued_at.timestamp()),
         "exp": int(expires_at.timestamp()),
     }
     token = jose_jwt.encode(claims, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
     return token, issued_at, expires_at
+
+
+_ORG_SELECTION_TOKEN_TYPE = "org_selection"
+
+
+def _issue_org_selection_token(user_id: uuid.UUID) -> tuple[str, datetime]:
+    """Sign a short-lived token proving `user_id` already passed a password
+    check, for the multi-organization login flow -- returned to the client
+    inside `OrganizationSelectionRequired` and presented back to
+    `select_organization` alongside the organization the user picked.
+
+    Deliberately NOT an access token: it carries no `organization_id` (none
+    has been chosen yet) and is tagged `"type": "org_selection"` rather than
+    `"access"`, so `verify_access_token` -- and therefore every endpoint
+    behind `CurrentIdentity` -- refuses it even though it is validly signed
+    with the same `jwt_secret_key`. Its lifetime (`settings.
+    org_selection_token_expiry_minutes`, default 10) is intentionally much
+    shorter than a real access token's, since it only needs to survive the
+    one extra round trip of the user choosing an organization.
+    """
+    settings = get_settings()
+    issued_at = datetime.now(timezone.utc)
+    expires_at = issued_at + timedelta(minutes=settings.org_selection_token_expiry_minutes)
+    claims = {
+        "sub": str(user_id),
+        "type": _ORG_SELECTION_TOKEN_TYPE,
+        "iat": int(issued_at.timestamp()),
+        "exp": int(expires_at.timestamp()),
+    }
+    token = jose_jwt.encode(claims, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    return token, expires_at
+
+
+def _verify_org_selection_token(token: str) -> uuid.UUID:
+    """Verify and decode a `selection_token`, returning the `user_id` it was
+    issued for. Mirrors `verify_access_token`'s error shape (a generic
+    `PermissionDeniedError`, distinct error_code), but checks for
+    `"type": "org_selection"` instead of `"type": "access"` -- the two
+    verifiers are deliberately not shared, so a bug in one can never
+    accidentally relax the other.
+    """
+    settings = get_settings()
+    try:
+        claims = jose_jwt.decode(
+            token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
+        )
+    except JWTError as exc:
+        raise PermissionDeniedError(
+            "Invalid or expired organization selection token.",
+            error_code="auth.invalid_selection_token",
+        ) from exc
+
+    if claims.get("type") != _ORG_SELECTION_TOKEN_TYPE:
+        raise PermissionDeniedError(
+            "Invalid organization selection token.",
+            error_code="auth.invalid_selection_token",
+        )
+
+    try:
+        return uuid.UUID(claims["sub"])
+    except (KeyError, ValueError) as exc:
+        raise PermissionDeniedError(
+            "Malformed organization selection token.",
+            error_code="auth.invalid_selection_token",
+        ) from exc
 
 
 async def _issue_session(
@@ -729,7 +841,25 @@ async def _issue_session(
     (the same `family_id` carried forward from the token being rotated) --
     the only difference between "first login" and "rotation" from this
     function's point of view is which `family_id` the caller passes in.
+
+    Every caller (`complete_sso_login`, `signup`, `login_with_password`,
+    `refresh`) reaches this function before any `Identity`-driven dependency
+    (`app.api.deps.get_current_identity`) has had a chance to call
+    `set_tenant_context` -- there is no request-scoped Identity yet at all
+    on a first login/signup, and `refresh` resolves its own organization_id
+    from the presented token rather than from an Identity. Milestone 10's
+    `refresh_tokens` row is `FORCE ROW LEVEL SECURITY` (`c7d4e8f19a2b`), so
+    the INSERT below is itself RLS-checked like any other write to that
+    table -- calling `set_tenant_context` here, once, right before it,
+    means every caller gets this for free instead of each having to
+    remember it independently (a real gap: none of the three
+    session-issuing callers set it themselves before this change, which
+    surfaced as `asyncpg.exceptions.InvalidTextRepresentationError: invalid
+    input syntax for type uuid: ""` the moment the app actually connected
+    as the RLS-enforced `ekip_app` role instead of the `BYPASSRLS`
+    `neondb_owner` every environment used until now).
     """
+    await set_tenant_context(session, organization_id)
     access_token, issued_at, access_expires_at = _issue_access_token(user_id, organization_id)
     raw_refresh_token = secrets.token_urlsafe(48)
     refresh_expires_at = issued_at + _REFRESH_TOKEN_LIFETIME
@@ -886,6 +1016,18 @@ def verify_access_token(token: str) -> TokenClaims:
     unexpired" -- turning that into a full `Identity` (with roles/permissions
     resolved) is `core.users.service.resolve_identity`'s job, called
     separately by whatever boundary layer (REST or MCP) verified this token.
+
+    The `claims.get("type", "access")` check below is deliberately
+    backward-compatible: a token signed before this multi-organization
+    change shipped (`_issue_access_token` not yet setting `"type"`) has no
+    `type` claim at all, and is treated as `"access"` rather than rejected --
+    otherwise every access token already outstanding at deploy time would
+    suddenly fail verification. Only a token explicitly tagged some other
+    type (currently just `_ORG_SELECTION_TOKEN_TYPE`,
+    `"org_selection"`) is rejected here, which is exactly the new case this
+    guards against: an `OrganizationSelectionRequired.selection_token`
+    presented to an ordinary `CurrentIdentity`-gated endpoint instead of to
+    `select_organization`.
     """
     settings = get_settings()
     try:
@@ -896,6 +1038,11 @@ def verify_access_token(token: str) -> TokenClaims:
         raise PermissionDeniedError(
             "Invalid or expired access token.", error_code="auth.invalid_token"
         ) from exc
+
+    if claims.get("type", "access") != "access":
+        raise PermissionDeniedError(
+            "This token is not a valid access token.", error_code="auth.invalid_token"
+        )
 
     try:
         return TokenClaims(
@@ -908,3 +1055,96 @@ def verify_access_token(token: str) -> TokenClaims:
         raise PermissionDeniedError(
             "Malformed access token.", error_code="auth.invalid_token"
         ) from exc
+
+
+# --- Multi-organization selection/switching ----------------------------------
+
+
+async def select_organization(session: AsyncSession, data: OrganizationSelectionRequest) -> SessionTokens:
+    """Complete a multi-organization login: exchange a `selection_token`
+    (from `login_with_password`'s `OrganizationSelectionRequired` response)
+    plus a chosen `organization_id` for real `SessionTokens`.
+
+    Security model, per the task's explicit requirement: `data.
+    organization_id` is a request, never trusted by itself. The flow is
+    `client requests organization X -> backend authenticates current user
+    (via the selection_token, which already proved the password check
+    succeeded) -> backend independently re-verifies user<->organization X
+    membership via list_organizations_for_login -> backend issues a JWT for
+    organization X` -- at no point does a client-supplied organization_id
+    get written into a token without that membership check running first.
+    """
+    user_id = _verify_org_selection_token(data.selection_token)
+    organization_ids = await users_service.list_organizations_for_login(session, user_id)
+    if data.organization_id not in organization_ids:
+        raise PermissionDeniedError(
+            "You are not a member of that organization.", error_code="auth.not_a_member"
+        )
+
+    tokens = await _issue_session(
+        session, user_id=user_id, organization_id=data.organization_id, family_id=uuid.uuid4()
+    )
+    logger.info(
+        "organization_selection_completed",
+        user_id=str(user_id),
+        organization_id=str(data.organization_id),
+    )
+    return tokens
+
+
+async def switch_organization(
+    session: AsyncSession, *, user_id: uuid.UUID, data: SwitchOrganizationRequest
+) -> SessionTokens:
+    """Re-scope an already-authenticated session to a different organization
+    the same user also belongs to (`POST /auth/switch-organization`).
+
+    `user_id` comes from the caller's *existing*, already-verified
+    `CurrentIdentity` (resolved by the router from their current access
+    token) -- never from the request body. Same security model as
+    `select_organization`: `data.organization_id` is independently
+    re-verified via `list_organizations_for_login` before anything is
+    issued, so a user cannot switch into an organization by simply naming
+    its id. A brand-new access + refresh token pair is issued for the
+    target organization (a fresh `family_id`, exactly like a new login)
+    rather than mutating the caller's existing token in place -- the old
+    token/session for the previous organization is left exactly as it was
+    (still valid until its own expiry/logout), it simply does not carry
+    access to the newly selected organization, matching the task's
+    requirement that switching happen through a newly issued token rather
+    than by granting the old one broader scope.
+    """
+    organization_ids = await users_service.list_organizations_for_login(session, user_id)
+    if data.organization_id not in organization_ids:
+        raise PermissionDeniedError(
+            "You are not a member of that organization.", error_code="auth.not_a_member"
+        )
+
+    tokens = await _issue_session(
+        session, user_id=user_id, organization_id=data.organization_id, family_id=uuid.uuid4()
+    )
+    logger.info(
+        "organization_switch_completed",
+        user_id=str(user_id),
+        organization_id=str(data.organization_id),
+    )
+    return tokens
+
+
+async def list_available_organizations(
+    session: AsyncSession, user_id: uuid.UUID
+) -> OrganizationsListResponse:
+    """List every organization the given (already-authenticated) `user_id`
+    belongs to, for `GET /auth/organizations`.
+
+    The router passes `actor.user_id` from `CurrentIdentity` -- the verified
+    caller's own id, never a client-supplied one -- so this always answers
+    "which organizations does the *caller* belong to," never an arbitrary
+    other user's membership.
+    """
+    organization_ids = await users_service.list_organizations_for_login(session, user_id)
+    organizations = await tenancy_repository.get_organizations_by_ids(session, organization_ids)
+    return OrganizationsListResponse(
+        organizations=tuple(
+            OrganizationSummary(id=org.id, name=org.name, slug=org.slug) for org in organizations
+        )
+    )

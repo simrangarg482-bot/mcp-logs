@@ -1388,6 +1388,362 @@ limitation, unchanged from Phase 24; hosted CI execution unverified (only
 local runs occurred, though the new tests need no secrets to run there
 either way).
 
+## Phase 27 (Confidence/grounding calibration review, this session)
+
+Requested directly: make `app.agents.confidence`'s routing mechanism
+"production-ready through an evidence-based calibration process," with an
+explicit instruction not to blindly change `_SIGNAL_WEIGHTS`,
+`_DENSE_SIMILARITY_FLOOR`/`_DENSE_SIMILARITY_CEILING`, or
+`Settings.confidence_threshold` without measured evidence.
+
+**Conclusion up front: no values were changed.** Every existing piece of
+calibration infrastructure (`app.evaluation`, `app.evaluation.semantic`,
+`scripts/eval_confidence.py`) was inspected and re-run rather than
+rebuilt -- it already existed, in good shape, from Phases 22-24. What this
+review added is two confirmed findings that change what today's evidence
+actually supports, a stale-documentation fix, and a new regression-test
+file protecting today's (unchanged) behavior against a future silent
+drift.
+
+**Baseline re-established (Tier 1, deterministic, no live dependency)**:
+`python scripts/run_evaluation.py` -- `VERDICT: CLEAN`, 56 cases (42
+passed, 14 negative controls correctly detected), unchanged from Phase
+23/24's own count. Its console "Confidence calibration" section reported
+n=9, calibration error 0.240 (buckets `[0.6-0.7) predicted 0.617 actual
+0.333`, `[0.7-0.8) predicted 0.732 actual 0.500`, `[0.8-0.9) predicted
+0.810 actual 1.000`).
+
+**Finding 1 (genuinely new): that calibration-error number is not evidence
+about `app.agents.confidence` at all.** Traced `report.calibration`'s nine
+`(predicted_confidence, was_correct)` pairs back to their source:
+`app.evaluation.runner`'s deterministic mode uses `FixtureAnswerAdapter`
+(`app.evaluation.adapters.generation`), which returns HAND-AUTHORED
+confidence numbers from `app.evaluation.fixtures.canned_generations` keyed
+by case id -- by that adapter's own docstring, deliberately never derived
+from a dataset or from calling `evaluate_confidence`. Confirmed by
+`inspect.getsource`: `FixtureAnswerAdapter.generate_answer` contains no
+reference to `app.agents.confidence` anywhere. So Tier 1's calibration
+section measures whether the evaluation harness's OWN fixture authors
+picked internally-consistent confidence numbers -- a real, useful check on
+the harness, but zero evidence about whether `_SIGNAL_WEIGHTS`/floor/
+ceiling are well-calibrated in production. Not previously stated this
+plainly anywhere in the docs; now is (this entry, plus a pinning
+regression test -- see below).
+
+**Live evaluation status: confirmed BLOCKED, as already tracked.**
+`scripts/eval_confidence.py` needs a live database with real data already
+ingested into the `test-org` organization and a funded `OPENAI_API_KEY`.
+This environment has neither (no `.env` file at all in the working
+checkout; `DATABASE_URL`/`OPENAI_API_KEY` unset) -- consistent with every
+prior phase's own finding. No live run was attempted; no results were
+fabricated.
+
+**Finding 2 (genuinely new, and the more consequential one): the four
+checked-in `scripts/eval_confidence_report*.json` files are not just
+below the 20-example calibration floor (already tracked, `insufficient_data`
+in `docs/SEMANTIC_BENCHMARK.md`'s threshold inventory) -- they are STALE
+relative to the current scoring formula, independent of sample size.**
+All four (`eval_confidence_report.json`, `_before.json`, `_after.json`,
+`_after_noinfo.json`) carry `generated_at` timestamps of 2026-08-13/14.
+`app/agents/confidence.py`'s own module docstring documents two later,
+real rewrites of the signals these reports were measuring:
+`_normalize_rerank_score`'s calibration (2026-08-30 live trace) and
+`_normalize_top_similarity`/`_distinct_source_count_signal`'s shape fixes
+(EKIP audit 2026-09-02, findings 1 and 2 -- the fused-RRF-score bug and the
+linear source-count penalty). Every existing report measured a routing
+formula that no longer exists. `docs/SEMANTIC_BENCHMARK.md`'s threshold
+inventory also still listed `Settings.confidence_threshold`'s "Current
+value" as the pre-Phase-22 `0.6`, when `app/shared/config/settings.py`'s
+actual shipped default is `0.5` -- simple doc drift, now fixed in that
+table alongside the staleness note. Net effect: there is currently zero
+valid live-production evidence for `_SIGNAL_WEIGHTS`,
+`_DENSE_SIMILARITY_FLOOR`/`_DENSE_SIMILARITY_CEILING`, or
+`Settings.confidence_threshold` -- not "insufficient sample size," but
+"no sample that measures the code as it exists today."
+
+**Per the task's own instruction, no values were changed.** Changing
+`_SIGNAL_WEIGHTS`, the floor/ceiling, or the threshold now, with the
+evidence base described above, would be exactly the "looks reasonable"
+tuning this priority exists to prevent. `Settings.confidence_threshold`
+was already configurable via `Settings`/environment before this review
+(`app/shared/config/settings.py`); that remains unchanged and is the
+correct mechanism for a future evidence-based update.
+
+**One characterization finding worth flagging for the next real
+calibration pass, not acted on here**: computed (via the unchanged, real
+`_normalize_top_similarity`/`_normalize_rerank_score`/`_weighted_score`
+helpers, not by hand) what the current formula does when dense similarity
+is strong but the cross-encoder reranker strongly disagrees -- e.g. raw
+`top_similarity=0.65` (at the calibrated ceiling) with `rerank_score=-20.0`
+(the reranker flatly rejecting the same top chunk) and a single source
+still composes to `confidence_score≈0.562`, above the real `0.5` default
+threshold, i.e. routes to `"answer"` despite the reranker's disagreement.
+`top_similarity`'s weight (0.40, the largest of the four) and a single
+source's own 0.70 floor on `_distinct_source_count_signal`'s curve are
+enough on their own to outweigh a reranker score at the extreme low end of
+its calibrated range. This is reported as a named scenario for a future
+live calibration run to check against real ground truth
+(`test_high_similarity_with_strongly_conflicting_rerank_signal` pins the
+current numeric behavior, not a claim that it is safe) -- not treated as
+grounds to reweight `_SIGNAL_WEIGHTS` unilaterally here, which would be
+exactly the un-evidenced tuning this priority forbids.
+
+**Added**: `tests/agents/test_confidence_routing_scenarios.py` (9 new
+tests) -- clearly answerable/high-confidence -> answer;
+clearly-unsupported -> investigation; borderline evidence (both signals at
+their own documented "coin flip" anchors); high similarity with strongly
+conflicting rerank (the named limitation above); low similarity despite
+strong rerank + many sources; the inclusive `>=` boundary at the real
+production default (not an arbitrary test threshold); a canary pinning
+`Settings.confidence_threshold`'s shipped default itself (0.5); and two
+regression guards for this review's own two findings (the fixture-vs-real-
+formula gap, and the report-staleness gap). Every expected score is
+computed independently through the same private helper functions
+`evaluate_confidence` calls, never a hand-typed constant, so this file
+breaks loudly if a future change to the weights/floor/ceiling/threshold
+shifts any pinned outcome without updating this file's own evidence trail.
+
+**Updated**: `docs/SEMANTIC_BENCHMARK.md`'s threshold inventory row for
+`Settings.confidence_threshold` (current-value correction, staleness
+note -- see Finding 2 above).
+
+**Verified**: `tests/agents/test_confidence_routing_scenarios.py` (9/9
+passed), `tests/core/auth/` + `tests/api/` (125/125 passed, unrelated to
+this change -- last touched earlier this session), Tier 1
+`scripts/run_evaluation.py` re-run clean (`VERDICT: CLEAN`, 56 cases,
+unchanged). Full backend suite not re-run in this pass (this environment's
+per-command timeout does not fit the full suite in one call); nothing in
+`app/agents/confidence.py` itself was modified, so no broader regression
+is expected, but a full `pytest` run is recommended before this is
+considered fully re-verified.
+
+**Runbook for completing production validation (unchanged prerequisite,
+restated precisely)**:
+```
+python scripts/eval_confidence.py --report-path scripts/eval_confidence_report_<YYYY-MM-DD>.json
+```
+Requires: (1) a live Postgres database with the same kind of real,
+already-ingested corpus `tests/rag_validation/rag_dataset.json` and
+`scripts/eval_confidence_dataset.json` already assume (a `test-org`
+organization with real Slack/GitHub-sourced documents -- 81 documents in
+the last known-good corpus, per that dataset's own header comment); (2) a
+funded `OPENAI_API_KEY` (real cost per run, `answer_question`'s real LLM
+calls). Then: read the new report's `threshold_sweep` and
+`confidence_by_category` sections, re-run
+`app.evaluation.semantic.calibration.calibration_from_eval_confidence_report`
+against it (via `scripts/run_semantic_evaluation.py` or directly) to check
+whether n now clears the 20-example floor and whether `status` reaches
+`"provisional"` or, across repeated runs, `"calibrated"` -- only then
+change `Settings.confidence_threshold`'s default, citing that run's date
+and numbers in the field's own comment, per that comment's existing
+instruction. The same run's raw per-category confidence values are also
+the first real opportunity to check `_SIGNAL_WEIGHTS` against ground
+truth (bucket the real `confidence_signals` values `eval_confidence.py`
+already records per question against `expected_route`, the same way this
+session's fixture-derived n=9 bucket analysis works, just on real data).
+
+**Deferred, unchanged from Phase 23/24**: no realistic production corpus
+beyond the existing 36-question `test-org` golden set; `_SIGNAL_WEIGHTS`
+remains a 4-value weighting scheme, not a single scalar
+`app.evaluation.semantic.calibration.sweep_binary_threshold` can examine
+directly (still `insufficient_data (n=0)` by that package's own
+classification, unchanged); same-provider evaluator limitation; hosted CI
+execution of the live-data jobs still unverified.
+
+## Phase 28 (Multi-organization login/session design gap, this session)
+
+**Root cause**: `core.auth.service._issue_access_token` puts exactly one
+`organization_id` into an access token, and `core.auth.service.login_with_password`
+resolved that single organization via `core.users.service.resolve_organization_for_login`
+-> `core.users.repository.get_first_organization_id` -> `resolve_user_first_organization`
+(a `LIMIT 1`-shaped SQL function, `c5e2a9f4d7b3`) -- a password-authenticated
+user who belongs to more than one organization was silently logged into
+whichever one that function happened to return first, with no way to
+choose or later switch. `UserRole`'s `(user_id, organization_id, role_id)`
+composite primary key already represents multi-organization membership at
+the data layer; nothing above it could act on that.
+
+**Fix, at a glance**: `login_with_password` now calls a new, additive
+sibling (`core.users.service.list_organizations_for_login` ->
+`core.users.repository.list_organization_ids` -> a new SECURITY DEFINER
+`list_user_organization_ids` SQL function, migration `f6a7b8c9d0e1`) that
+returns *every* organization the user belongs to, and branches on the
+count: 0 -> unchanged `auth.no_organization` error; 1 -> unchanged
+single-organization login; >1 -> a new `OrganizationSelectionRequired`
+response instead of a silent pick, carrying a short-lived
+`selection_token` and the candidate organizations. `resolve_organization_for_login`
+and `get_first_organization_id` are both left completely unchanged (per
+the task's explicit instruction) and are simply no longer called from
+`login_with_password`.
+
+**Current login behavior before this change**: `POST /auth/login` always
+returned `SessionTokens` (an access + refresh token pair), for exactly one
+organization, chosen by `get_first_organization_id`'s `LIMIT 1` query --
+deterministic only in the sense that the same query plan tends to return
+rows in the same order, never a documented or guaranteed ordering.
+
+**New multi-organization login flow**:
+  1. `POST /auth/login` (email/password) succeeds password verification as
+     before.
+  2. Backend resolves every organization the user is a member of
+     (`list_organizations_for_login`).
+  3. Exactly one organization -> `SessionTokens` (`status: "complete"`),
+     byte-for-byte the same behavior a single-organization user always saw
+     (plus the additive `status` field, which nothing existing reads).
+  4. More than one -> `OrganizationSelectionRequired` (`status:
+     "organization_selection_required"`): a `selection_token` (proves the
+     password check already succeeded, 10-minute default expiry, configurable
+     via `Settings.org_selection_token_expiry_minutes`) plus the list of
+     candidate organizations (`id`/`name`/`slug` only).
+  5. Client calls `POST /auth/select-organization` with that
+     `selection_token` plus the chosen `organization_id`. The backend
+     independently re-verifies membership (never trusts the request body's
+     `organization_id` by itself) and, only then, issues real `SessionTokens`
+     for that organization.
+  6. Separately, an already-logged-in user can call
+     `POST /auth/switch-organization` (bearer-token authenticated) to
+     re-scope to a different organization they also belong to -- same
+     independent membership re-verification, same fresh-token-issuance
+     model. `GET /auth/organizations` lists the caller's own memberships for
+     building a switcher UI.
+
+**Endpoints added/changed**:
+  - `POST /auth/login` -- response type changed from `SessionTokens` to the
+    discriminated union `SessionTokens | OrganizationSelectionRequired`
+    (`LoginResponse`, `Field(discriminator="status")`); existing
+    single-organization behavior is unchanged.
+  - `POST /auth/select-organization` (new) -- exchanges a `selection_token`
+    + chosen `organization_id` for `SessionTokens`. Same per-IP rate limit
+    as `/auth/login` (`_LOGIN_RATE_LIMIT`), since it is still an
+    unauthenticated, credential-adjacent endpoint.
+  - `POST /auth/switch-organization` (new, `CurrentIdentity`-gated) --
+    re-scopes an authenticated session to a different member organization,
+    returning fresh `SessionTokens`.
+  - `GET /auth/organizations` (new, `CurrentIdentity`-gated) -- lists every
+    organization the *caller* belongs to (`OrganizationsListResponse`),
+    derived from the verified identity, never a client-supplied user id.
+
+**JWT/session changes**:
+  - `_issue_access_token` now sets an explicit `"type": "access"` claim.
+    `verify_access_token` treats a *missing* `type` claim as `"access"`
+    (backward-compatible with every access token issued before this
+    change) but rejects any token whose `type` is something else.
+  - A new, distinct token kind: the org-selection token (`_issue_org_selection_token`
+    / `_verify_org_selection_token`, `"type": "org_selection"`), signed
+    with the same `jwt_secret_key` but never accepted by `verify_access_token`
+    or any `CurrentIdentity`-gated endpoint -- verified directly by unit
+    test (see below).
+  - Switching/selecting an organization always mints a brand-new access +
+    refresh token pair (`_issue_session`, fresh `family_id`) for the target
+    organization rather than mutating any existing token or session in
+    place; `_issue_session` itself already calls `set_tenant_context` for
+    the target organization before writing the new refresh token row, so
+    the new session is correctly tenant-scoped from the moment it's created.
+    The prior session (if any) is left exactly as it was -- still valid
+    until its own expiry/logout, but it does not gain access to the newly
+    selected organization.
+
+**Security checks performed**:
+  - `select_organization` and `switch_organization` both independently
+    call `list_organizations_for_login` and reject (`auth.not_a_member`)
+    if the requested `organization_id` is not in that list -- a client
+    naming a real organization it does not belong to is rejected exactly
+    like naming a nonexistent one (test: "cannot access Organization B data
+    merely by manipulating the requested organization ID").
+  - `switch_organization`'s `user_id` comes only from the router's
+    `CurrentIdentity` dependency (the caller's own verified access token),
+    never from the request body.
+  - Verified end to end (not just by construction) that an org-selection
+    token is rejected by `verify_access_token`, that an access token is
+    rejected by `_verify_org_selection_token`, and that a real,
+    pre-existing-shape access token (no `type` claim, as every token
+    issued before this change looked) still verifies successfully --
+    exercised directly against the real JWT sign/verify code path, not
+    mocked.
+  - `get_organizations_by_ids` returns `[]` (never "every organization")
+    for an empty id list, so a zero-organization user's
+    `GET /auth/organizations` can never accidentally leak the full
+    organization table.
+  - No RLS/tenant-isolation policy was touched. `list_user_organization_ids`
+    (the new SQL function) is a narrow, read-only, `SECURITY DEFINER`
+    enumeration of exactly the same shape as the existing
+    `resolve_user_first_organization` -- "which organizations does this
+    user_id hold a role in" -- generalized from `LIMIT 1` to no limit;
+    `organizations` itself carries no RLS policy (confirmed by inspection:
+    it IS the tenant boundary, not something a policy scopes), so reading
+    it by a caller-verified id list needs no `set_tenant_context` call, the
+    same reasoning `get_organization_by_id` already relied on.
+
+**Tests added** (`tests/core/auth/test_multi_organization_login.py`, 14
+tests; `tests/core/users/test_multi_org_repo_additions.py`, 5 tests) --
+covering, by the task's own numbering:
+  1. Single-org user logs in normally (`status: "complete"`, one
+     `_issue_session` call for that organization).
+  2. Multi-org user gets `OrganizationSelectionRequired`, never a silently
+     issued token.
+  3. `list_available_organizations` returns only the caller's own
+     organizations.
+  4. Both `switch_organization` and `select_organization` reject a
+     non-member organization id.
+  5/6. A successful switch issues a token for the *selected* organization
+     specifically (verified via `_issue_session`'s recorded call args and,
+     separately, a real `_issue_access_token`/`verify_access_token` round
+     trip).
+  7/8. Full existing suite re-run (below) -- no regressions.
+  9. Explicitly restated "attacker" framing: a real organization id the
+     caller does not belong to is rejected exactly like scenario 4.
+  10. Zero-organization users: login rejected safely
+     (`auth.no_organization`, unchanged), switch rejected
+     (`auth.not_a_member`), organizations listing returns empty rather than
+     erroring.
+  Plus: token-type isolation in both directions, and the pre-existing
+  (no-`type`-claim) access token backward-compatibility case.
+
+**Full test results**: `tests/core/auth/test_multi_organization_login.py`
+14/14 passed; `tests/core/users/test_multi_org_repo_additions.py` 5/5
+passed. Full existing suite re-run across
+`tests/{core,api,agents,database,shared,ingestion,ingestion_retrieval,retrieval,mcp}`:
+904 passed, 2 failed / 5 errors -- all five errors and both failures are
+`tests/shared/security/test_azure_kms.py`'s pre-existing `ModuleNotFoundError:
+No module named 'azure'` (the `azure-*` SDK packages are not installed in
+this environment; unrelated to this change, confirmed by re-reading that
+file: it tests `core.tenancy`'s Azure Key Vault KMS provider, nothing this
+task touched). No test outside that one file failed. Migration head
+verified via the same regex-based script used earlier this session: 22
+total migrations, single head `f6a7b8c9d0e1`. OpenAPI schema generation for
+`/auth/login` verified directly: a proper `oneOf` with a `discriminator`
+mapping `"complete"` -> `SessionTokens` and
+`"organization_selection_required"` -> `OrganizationSelectionRequired`.
+
+**Frontend work**: not yet done this pass -- see "Any remaining
+limitations" below; `frontend/src/context/TenantContext.tsx`'s own Phase
+7.8 docstring already anticipated exactly this backend capability
+("build this once it does, not before") and is the natural next place to
+wire a real organization switcher once the frontend changes are made.
+
+**Any remaining limitations**:
+  - Frontend (`types/auth.ts`, `api/auth.ts`, `AuthContext.tsx`, a
+    login-time organization-selection UI, `TenantContext.tsx`/
+    `TenantSwitcher.tsx`) has not yet been updated to consume the new
+    `OrganizationSelectionRequired` login response or the
+    select/switch/list endpoints -- today's frontend `login()` still
+    expects a bare `SessionTokens` and would need to branch on `status`
+    the same way the backend now does.
+  - `select_organization`/`switch_organization` currently accept any
+    request whose membership check passes with no additional rate
+    limiting beyond `/auth/select-organization` sharing `/auth/login`'s
+    per-IP limit; `/auth/switch-organization` (bearer-token gated) has no
+    dedicated rate limit of its own, matching every other
+    `CurrentIdentity`-gated endpoint in this router today.
+  - No UI/API surfaces an organization's `name`/`slug` beyond the minimal
+    `OrganizationSummary` shape -- sufficient for a switcher, not a full
+    organization-management view.
+  - This still assumes password-authenticated multi-organization
+    membership arises only via some out-of-band mechanism (invitations,
+    admin action) -- `signup` itself still always creates exactly one new
+    organization per account, unchanged.
+
+
 ## Important context to continue
 
 - Never fabricate test/verification results. Distinguish PASS (actually run, actually passed) / PARTIAL / BLOCKED (environment-limited) / FAILED honestly, always.

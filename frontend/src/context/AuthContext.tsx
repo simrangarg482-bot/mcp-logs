@@ -1,5 +1,14 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { AuthUser, InvitationAcceptPayload, LoginPayload, SessionTokens, SignupPayload } from "@/types/auth";
+import type {
+  AuthUser,
+  InvitationAcceptPayload,
+  LoginPayload,
+  OrganizationSelectionPayload,
+  OrganizationSelectionRequired,
+  SessionTokens,
+  SignupPayload,
+  SwitchOrganizationPayload,
+} from "@/types/auth";
 import * as authApi from "@/api/auth";
 import {
   clearSession,
@@ -11,12 +20,26 @@ import {
   setRefreshToken,
 } from "./tokenStore";
 
+// login's return value: undefined for the unchanged single-organization
+// case (a session was already applied, same as before this fix existed),
+// or the OrganizationSelectionRequired payload when the caller must show
+// an organization picker before a session exists. Callers that only ever
+// dealt with single-organization users can keep ignoring the return value
+// entirely -- it stays undefined for them, exactly as before.
+type LoginOutcome = OrganizationSelectionRequired | undefined;
+
 interface AuthContextValue {
   user: AuthUser | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   signup: (payload: SignupPayload) => Promise<void>;
-  login: (payload: LoginPayload) => Promise<void>;
+  login: (payload: LoginPayload) => Promise<LoginOutcome>;
+  // Completes a multi-organization login after the caller shows the user
+  // OrganizationSelectionRequired.organizations and they pick one.
+  selectOrganization: (payload: OrganizationSelectionPayload) => Promise<void>;
+  // Re-scopes an already-authenticated session to a different organization
+  // the user also belongs to (POST /auth/switch-organization).
+  switchOrganization: (payload: SwitchOrganizationPayload) => Promise<void>;
   acceptInvitation: (invitationId: string, payload: InvitationAcceptPayload) => Promise<void>;
   logout: () => Promise<void>;
 }
@@ -82,8 +105,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const handleLogin = useCallback(
-    async (payload: LoginPayload) => {
-      await applySession(await authApi.login(payload));
+    async (payload: LoginPayload): Promise<LoginOutcome> => {
+      const result = await authApi.login(payload);
+      if (result.status === "organization_selection_required") {
+        // Do NOT touch stored tokens/user state here -- login succeeding
+        // for a multi-organization user does not mean a session exists yet.
+        // The caller must show `result.organizations` and call
+        // `selectOrganization` with the user's choice.
+        return result;
+      }
+      await applySession(result);
+      return undefined;
+    },
+    [applySession],
+  );
+
+  const handleSelectOrganization = useCallback(
+    async (payload: OrganizationSelectionPayload) => {
+      await applySession(await authApi.selectOrganization(payload));
+    },
+    [applySession],
+  );
+
+  const handleSwitchOrganization = useCallback(
+    async (payload: SwitchOrganizationPayload) => {
+      // A fresh access + refresh token pair for the target organization --
+      // applySession replaces the stored session outright (never merges),
+      // matching switch_organization's "new token, not a mutated old one"
+      // model server-side.
+      await applySession(await authApi.switchOrganization(payload));
     },
     [applySession],
   );
@@ -114,10 +164,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       isLoading,
       signup: handleSignup,
       login: handleLogin,
+      selectOrganization: handleSelectOrganization,
+      switchOrganization: handleSwitchOrganization,
       acceptInvitation: handleAcceptInvitation,
       logout: handleLogout,
     }),
-    [user, isLoading, handleSignup, handleLogin, handleAcceptInvitation, handleLogout],
+    [
+      user,
+      isLoading,
+      handleSignup,
+      handleLogin,
+      handleSelectOrganization,
+      handleSwitchOrganization,
+      handleAcceptInvitation,
+      handleLogout,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

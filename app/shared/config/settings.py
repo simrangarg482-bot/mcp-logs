@@ -177,6 +177,19 @@ class Settings(BaseSettings):
     # against live `test-org` data, check its per-category regression output,
     # set this from that sweep, and replace this comment with the run's date
     # and findings. scripts/eval_confidence_report.json is stale until then.
+    #
+    # RE-CONFIRMED, 2026-09-05 calibration review (docs/PROJECT_STATUS.md
+    # Phase 27): still not empirically calibrated. Live evaluation remains
+    # blocked in every environment tried so far (no live test-org database +
+    # funded OPENAI_API_KEY available) -- this review did not fabricate a
+    # number to fill that gap. Also confirmed: every existing checked-in
+    # scripts/eval_confidence_report*.json predates BOTH the 2026-08-30
+    # reranker calibration and the 2026-09-02 signal-shape rewrite
+    # (app/agents/confidence.py's own module docstring) -- those reports
+    # measured a since-replaced scoring formula, so they are not valid
+    # evidence for this default even setting aside their small sample size
+    # (n=14, below app.evaluation.semantic.calibration's 20-example floor).
+    # This value (0.5) is an honest placeholder, not a validated one.
     confidence_threshold: float = Field(
         default=0.5,
         ge=0.0,
@@ -256,6 +269,21 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 60
     REFRESH_TOKEN_EXPIRY_DAYS: ClassVar[int] = 30
+    org_selection_token_expiry_minutes: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "How long a multi-organization login's `selection_token` "
+            "(core.auth.schemas.OrganizationSelectionRequired) stays valid "
+            "before `POST /auth/select-organization` must be called. Signed "
+            "with the same jwt_secret_key but a distinct token `type` claim "
+            "(see core.auth.service.verify_access_token's type check) so it "
+            "can never be presented as, or accidentally accepted as, a real "
+            "access token -- deliberately short-lived since it exists only "
+            "to bridge the few seconds between a successful password check "
+            "and the user picking which of their organizations to log into."
+        ),
+    )
 
     # --- MCP server (scripts/run_mcp_server.py) -----------------------------
     mcp_port: int = Field(

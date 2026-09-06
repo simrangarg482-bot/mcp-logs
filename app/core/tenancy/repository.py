@@ -79,6 +79,35 @@ async def get_organization_by_slug(
     return result.scalar_one_or_none()
 
 
+async def get_organizations_by_ids(
+    session: AsyncSession, organization_ids: Sequence[uuid.UUID]
+) -> Sequence[Organization]:
+    """Fetch `Organization` rows for a caller-supplied set of ids, in no
+    particular order -- for the multi-organization login/session work
+    (`core.users.service.list_organizations_for_login`), turning a
+    membership id list into the `{id, name, slug}` summaries a login/
+    organizations response actually needs to show a person.
+
+    Deliberately unscoped by any organization_id filter, same as
+    `list_organizations` above -- but unlike that function this is NOT a
+    system-internal "every organization" listing: the caller is expected to
+    have already restricted `organization_ids` to ones a specific user
+    actually belongs to (via `list_user_organization_ids`/
+    `list_organizations_for_login`) before calling this. This is safe
+    without `set_tenant_context` for the same reason `get_organization_by_id`
+    above is: `organizations` itself carries no RLS policy, since it IS the
+    tenant boundary a policy would otherwise scope by (see the `Organization`
+    model's own docstring) -- there is no narrower row set to leak into.
+    An empty `organization_ids` returns an empty sequence rather than every
+    organization, unlike a naive unfiltered query would.
+    """
+    if not organization_ids:
+        return []
+    stmt = select(Organization).where(Organization.id.in_(organization_ids))
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
 # --- Projects ----------------------------------------------------------------
 
 

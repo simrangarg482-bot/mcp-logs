@@ -4,8 +4,12 @@ import type {
   AuthUser,
   InvitationAcceptPayload,
   LoginPayload,
+  LoginResponse,
+  OrganizationSelectionPayload,
+  OrganizationsListResponse,
   SessionTokens,
   SignupPayload,
+  SwitchOrganizationPayload,
 } from "@/types/auth";
 
 interface UserProfileResponse {
@@ -40,11 +44,64 @@ export async function signup(payload: SignupPayload): Promise<SessionTokens> {
   return apiRequest<SessionTokens>("/auth/signup", { method: "POST", body: payload });
 }
 
-export async function login(payload: LoginPayload): Promise<SessionTokens> {
+export async function login(payload: LoginPayload): Promise<LoginResponse> {
   if (USE_MOCK_DATA) {
     return mockDelay(MOCK_TOKENS, 400);
   }
-  return apiRequest<SessionTokens>("/auth/login", { method: "POST", body: payload });
+  // core.auth.schemas.LoginResponse: SessionTokens (status: "complete") for
+  // a single-organization user, or OrganizationSelectionRequired (status:
+  // "organization_selection_required") for a multi-organization one -- the
+  // caller (AuthContext.login) must branch on `.status` before treating
+  // this as a real session.
+  return apiRequest<LoginResponse>("/auth/login", { method: "POST", body: payload });
+}
+
+/**
+ * Second step of a multi-organization login: exchange the `selectionToken`
+ * an `OrganizationSelectionRequired` login response carried, plus the
+ * organization the user picked, for real `SessionTokens`. The backend
+ * independently re-verifies membership -- `organizationId` here is a
+ * request, not a trusted assertion.
+ */
+export async function selectOrganization(
+  payload: OrganizationSelectionPayload,
+): Promise<SessionTokens> {
+  if (USE_MOCK_DATA) {
+    return mockDelay(MOCK_TOKENS, 300);
+  }
+  return apiRequest<SessionTokens>("/auth/select-organization", { method: "POST", body: payload });
+}
+
+/**
+ * Re-scope the current session to a different organization the user also
+ * belongs to (`POST /auth/switch-organization`, bearer-token authenticated).
+ * Returns a brand-new access + refresh token pair for the target
+ * organization -- callers should replace their stored session with this
+ * response, not merge it into the old one.
+ */
+export async function switchOrganization(
+  payload: SwitchOrganizationPayload,
+): Promise<SessionTokens> {
+  if (USE_MOCK_DATA) {
+    return mockDelay(MOCK_TOKENS, 300);
+  }
+  return apiRequest<SessionTokens>("/auth/switch-organization", { method: "POST", body: payload });
+}
+
+/**
+ * Every organization the current caller belongs to (`GET /auth/organizations`),
+ * for building an organization switcher. Derived from the caller's own
+ * verified identity server-side -- there is no way to ask for another
+ * user's memberships through this endpoint.
+ */
+export async function listMyOrganizations(): Promise<OrganizationsListResponse> {
+  if (USE_MOCK_DATA) {
+    return mockDelay(
+      { organizations: [{ id: "org-1", name: "Navikenz", slug: "navikenz" }] },
+      200,
+    );
+  }
+  return apiRequest<OrganizationsListResponse>("/auth/organizations");
 }
 
 /**

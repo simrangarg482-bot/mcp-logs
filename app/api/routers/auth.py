@@ -28,12 +28,16 @@ from app.core.audit.service import record_audit_event
 from app.core.auth import service as auth_service
 from app.core.auth.schemas import (
     LoginRequest,
+    LoginResponse,
     LogoutAllResponse,
+    OrganizationSelectionRequest,
+    OrganizationsListResponse,
     RefreshRequest,
     SessionTokens,
     SignupRequest,
     SSOAuthorizationRedirect,
     SSOCallbackRequest,
+    SwitchOrganizationRequest,
 )
 from app.core.exceptions import ValidationError
 from app.core.users import service as users_service
@@ -89,10 +93,62 @@ async def signup(data: SignupRequest, session: DbSession) -> SessionTokens:
     return await auth_service.signup(session, data)
 
 
-@router.post("/login", response_model=SessionTokens, dependencies=[Depends(_LOGIN_RATE_LIMIT)])
-async def login(data: LoginRequest, session: DbSession) -> SessionTokens:
-    """Email/password login, counterpart to `signup`."""
+@router.post("/login", response_model=LoginResponse, dependencies=[Depends(_LOGIN_RATE_LIMIT)])
+async def login(data: LoginRequest, session: DbSession) -> LoginResponse:
+    """Email/password login, counterpart to `signup`.
+
+    Returns `SessionTokens` (`status: "complete"`) for a single-organization
+    user, unchanged from before -- or `OrganizationSelectionRequired`
+    (`status: "organization_selection_required"`) for a multi-organization
+    one, which no longer gets silently logged into whichever organization
+    came back first. See `auth_service.login_with_password`'s docstring.
+    """
     return await auth_service.login_with_password(session, data)
+
+
+@router.post(
+    "/select-organization", response_model=SessionTokens, dependencies=[Depends(_LOGIN_RATE_LIMIT)]
+)
+async def select_organization(data: OrganizationSelectionRequest, session: DbSession) -> SessionTokens:
+    """Complete a multi-organization login: exchange the `selection_token`
+    an `OrganizationSelectionRequired` login response carried, plus the
+    chosen `organization_id`, for real `SessionTokens`. Same rate limit as
+    `/auth/login` -- this is still an unauthenticated, credential-adjacent
+    endpoint (the selection_token stands in for the password check that
+    already happened), so it gets the same per-IP throttling.
+    """
+    return await auth_service.select_organization(session, data)
+
+
+@router.post("/switch-organization", response_model=SessionTokens)
+async def switch_organization(
+    data: SwitchOrganizationRequest, actor: CurrentIdentity, session: DbSession
+) -> SessionTokens:
+    """Re-scope an already-authenticated session to a different organization
+    the caller also belongs to. `actor.user_id` comes from the caller's own
+    verified access token (`CurrentIdentity`), never from the request body --
+    `auth_service.switch_organization` independently re-verifies membership
+    in `data.organization_id` before issuing anything.
+    """
+    if actor.user_id is None:
+        raise ValidationError(
+            "Only a user identity can switch organizations.", error_code="user.no_profile"
+        )
+    return await auth_service.switch_organization(session, user_id=actor.user_id, data=data)
+
+
+@router.get("/organizations", response_model=OrganizationsListResponse)
+async def list_my_organizations(actor: CurrentIdentity, session: DbSession) -> OrganizationsListResponse:
+    """List every organization the current caller belongs to -- derived from
+    `actor.user_id` (the verified caller's own identity), never a
+    client-supplied user id, so this can only ever answer "which
+    organizations am I a member of."
+    """
+    if actor.user_id is None:
+        raise ValidationError(
+            "Only a user identity has organization memberships.", error_code="user.no_profile"
+        )
+    return await auth_service.list_available_organizations(session, actor.user_id)
 
 
 @router.post("/refresh", response_model=SessionTokens)
