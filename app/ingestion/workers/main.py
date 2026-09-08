@@ -28,6 +28,33 @@ _settings = get_settings()
 
 async def _on_startup(ctx: dict) -> None:
     configure_worker_tracing("ekip-ingestion-worker")
+    # This worker's Redis connection sits in a tight poll loop for most of
+    # its life (arq's `_poll_iteration`), but can still go idle for long
+    # stretches whenever nothing is queued -- and, separately from the
+    # enqueue-side staleness `app.api.main`'s lifespan already works around
+    # (see that module's own comment), a poll call on a connection that
+    # died silently (a dropped TCP connection with no RST/FIN, common
+    # through NAT/load balancers on a long-idle link) can hang forever
+    # rather than raising: `build_redis_settings()` sets a *connect*
+    # timeout but no *read* timeout, so redis-py has nothing to time out
+    # on. Observed in practice: the worker logs its startup `redis_version`
+    # line successfully, then goes silent indefinitely with zero further
+    # output -- not even `ResilientIngestionWorker`'s own transient-error
+    # retry warning, because nothing ever raises for it to catch.
+    # `socket_timeout` bounds every read so a truly dead connection fails
+    # fast instead of hanging (letting `ResilientIngestionWorker` retry it
+    # normally); `health_check_interval` additionally has redis-py PING an
+    # idle connection before reuse and replace it proactively if that
+    # fails. Neither is exposed via arq's own `RedisSettings`/`create_pool`
+    # (same gap as the API-side fix), so both are set directly on the
+    # pool's connection kwargs here, applied immediately by disconnecting
+    # the one connection already opened for the startup `redis_version`
+    # check -- every connection this pool hands out afterward is created
+    # fresh from these kwargs.
+    redis = ctx["redis"]
+    redis.connection_pool.connection_kwargs["health_check_interval"] = 30
+    redis.connection_pool.connection_kwargs["socket_timeout"] = 30
+    await redis.connection_pool.disconnect()
 
 
 class WorkerSettings:

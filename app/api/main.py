@@ -99,6 +99,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             build_redis_settings(),
             default_queue_name="arq:queue:ingestion",
         )
+        # This pool only ever enqueues (`sync_connector`) -- unlike the
+        # ingestion/agents worker processes, which are constantly polling
+        # Redis, it can sit fully idle for many minutes between sync-now
+        # clicks. Redis Cloud silently drops a connection idle that long,
+        # and redis-py can then hand that dead connection back to the next
+        # `enqueue_job()` call, which returns normally (a clean `202`) even
+        # though nothing ever reached Redis -- observed in practice after
+        # ~20-30 minutes of inactivity between clicks. `health_check_interval`
+        # makes redis-py PING a connection that has been idle this long
+        # before reusing it, replacing it if the PING fails, instead of
+        # silently handing back a dead one. Not exposed via arq's own
+        # `RedisSettings`/`create_pool` (see `build_redis_settings`'s own
+        # docstring for why every Redis-connecting process already goes
+        # through that shared builder instead of a bare `RedisSettings.
+        # from_dsn`), so it's set directly on the pool's connection kwargs
+        # here and applied immediately by disconnecting the pool's initial
+        # (ping-only) connection -- every connection this pool ever hands
+        # out afterward is created fresh from these kwargs, health check
+        # included.
+        app.state.arq_pool.connection_pool.connection_kwargs["health_check_interval"] = 30
+        await app.state.arq_pool.connection_pool.disconnect()
     except Exception as exc:
         # Not `exc_info=True`: structlog's console renderer writes through
         # Python's default stdout encoding, which on Windows is the legacy
