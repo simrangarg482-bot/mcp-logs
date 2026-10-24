@@ -1,38 +1,10 @@
-"""Public interface for core/incidents -- incident CRUD, timeline, and the
-postmortem system of record (PROJECT_PLAN.md section 9.4).
-
-Owned by: core/incidents. Depends on core/users (`require_permission`),
-core/audit (`record_audit_event`), and core/tenancy (`get_default_project`,
-for defaulting `IncidentCreate.project_id` when omitted) -- the last of
-these is a new, flagged dependency edge in the same spirit as the
-`core/tenancy -> core/users` edge added for role-name resolution
-(ENGINEERING_DECISIONS.md's SSO-provisioning-policy entry): §9.4's own
-dependency list only names core/users, core/audit, database, shared, but
-resolving "which project" for an org that never bothered creating a second
-one genuinely belongs to core/tenancy, not a duplicated query here.
-
-Tenant isolation: every function takes `organization_id` and the calling
-`actor: Identity`, verified via `_ensure_same_organization` before anything
-else -- the same guard already used in core/tenancy/service.py. Incident and
-postmortem mutations additionally pass `project_id` into
-`require_permission`, making this the first real caller of the project-scoped
-authorization tier (`Identity.project_permissions`, PROJECT_PLAN.md section
-3.6) built earlier but never previously exercised.
-
-Two decisions worth stating plainly rather than leaving implicit:
-  - Postmortem status transitions are not fully pinned down anywhere in the
-    docs (a four-value `draft`/`in_review`/`approved`/`published` enum, but
-    only one explicit gate endpoint, `/postmortems/{id}/approve`).
-    `approve_postmortem` here produces `"approved"`, matching the endpoint's
-    name literally. `"published"` is left as a state some later, not-yet-built
-    pipeline (e.g. tied to the Knowledge Gap Agent / runbook proposal flow,
-    ARCHITECTURE.md section 5) would drive -- core/incidents does not trigger
-    it itself.
-  - `postmortem:write` (gating `update_postmortem`) is a permission code this
-    migration introduces; only `postmortem:approve` was named as an example
-    in DATABASE_DESIGN.md. Editing a draft and approving it are different
-    privilege levels in spirit (least privilege, PROJECT_PLAN.md section
-    12.8), so they get different codes rather than reusing one for both.
+"""This module manages incidents and their postmortems, including creating, updating,
+viewing timelines, and approving resolutions. It ensures users can access or modify only 
+data belonging to their own organization, checks permissions before changes, and records 
+audit events. If no project is specified when creating an incident, it gets the 
+organization’s default project. Postmortems become approved when approved; publishing 
+is left for a future workflow. Separate permissions are used for editing postmortems 
+and approving them to keep access secure.
 """
 
 from __future__ import annotations
@@ -186,18 +158,11 @@ async def create_incident(
 async def get_incident(
     session: AsyncSession, actor: Identity, organization_id: uuid.UUID, incident_id: uuid.UUID
 ) -> Incident:
-    """Fetch one incident. Raises NotFoundError if it doesn't exist (or
-    belongs to a different organization).
-
-    Gated by `incident:read` (project-scoped, org-level fallback) -- until
-    this fix, any organization member could read any incident's full detail
-    regardless of role (2026-08 audit "H4"; see
-    `EKIP_TENANT_ISOLATION_SECURITY_REVIEW.md` recommendation #3). The
-    permission-existence check happens after `_get_owned_incident` (same
-    order `update_incident` already uses), so a cross-organization/
-    nonexistent incident id still 404s before any permission is evaluated --
-    never leaking "this id exists, you just can't read it" to a caller who
-    can't see the row at all.
+    """This function fetches an incident and raises `NotFoundError` if it doesn't exist 
+    or belongs to another organization. It checks the user's `incident:read` permission 
+    before allowing access, based on their project role or organization-level permissions.
+    Checking whether the incident exists first ensures unauthorized users cannot discover
+    whether another organization's incident exists.
     """
     _ensure_same_organization(actor, organization_id)
     row = await _get_owned_incident(session, organization_id, incident_id)
@@ -209,7 +174,7 @@ async def list_incidents(
     session: AsyncSession, actor: Identity, organization_id: uuid.UUID, query: IncidentFilter
 ) -> list[Incident]:
     """Return incidents belonging to `organization_id`, filtered/paginated
-    per `query` (API_DESIGN.md: `GET /incidents`).
+    per `query`.
 
     Gated by an org-level `incident:read` check (no `project_id` --
     `IncidentFilter` has no project scoping, so this always spans every
@@ -338,39 +303,13 @@ async def record_investigation_result(
     incident_id: uuid.UUID,
     investigation: InvestigationResult,
 ) -> TimelineEntry:
-    """Attach an Investigation Agent's result to `incident_id`'s timeline --
-    the agent-authored write path `add_timeline_note`'s own docstring already
-    flagged as "a separate, not-yet-built write path." Built now (Milestone 7
-    task #24) because the Postmortem Agent's root-cause-extraction step
-    (AGENT_WORKFLOWS.md section 2.5) needs to find "any Investigation Agent
-    evidence attached to the incident" *somewhere durable* -- without this,
-    that documented step would be permanently unreachable, not merely
-    unimplemented. `InvestigationResult` living in `shared/schemas/` rather
-    than `agents/` is exactly what makes this importable from here without
-    `core` depending on `agents` -- `shared.schemas.agent_contracts`'s own
-    module docstring already names "core/incidents (persisting
-    `TriageResult`-shaped data into `incident_timeline`)" as an anticipated
-    consumer.
-
-    Not gated by `require_permission`: `actor` here is already whichever
-    identity was authorized to trigger `agents.triage_incident` (or
-    `answer_question`, for the incident-scoped low-confidence case) in the
-    first place -- this only records what that already-permitted call
-    produced, the same "persistence half of an already-triggered action"
-    reasoning `create_postmortem` gives for skipping its own gate.
-
-    `event_type="investigation"`, distinct from `add_timeline_note`'s
-    `"note"`; `event_data` holds `evidence`/`hypotheses`/`suggested_owner_team`/
-    `suggested_next_steps` as plain JSON-safe dicts (`model_dump(mode="json")`)
-    -- `incident_timeline` is meant to be readable on its own
-    (DATABASE_DESIGN.md), not require a join back into `agent_executions` to
-    reconstruct what an investigation found.
-
-    Priority 7 additions: `review_status`/`critique_verdict`/
-    `revision_count`/`critique_issues` (`agents.investigation.critique`) are
-    written the same way -- plain JSON-safe values, no schema change to this
-    table. `critique_issues` holds only short structured category tags
-    (e.g. `"overconfidence:hypothesis_0"`), never raw model reasoning.
+    """This function saves the Investigation Agent’s findings to an incident’s timeline 
+    so they can be used later by the Postmortem Agent to identify the root cause. It 
+    stores evidence, hypotheses, suggested teams, next steps, and review/critique results 
+    as JSON, making the timeline a permanent record without needing to fetch data from 
+    another table. It doesn’t check permissions again because the agent action was 
+    already authorized, and it stores only structured critique tags, not the model’s raw 
+    reasoning.
     """
     _ensure_same_organization(actor, organization_id)
     await _get_owned_incident(session, organization_id, incident_id)
@@ -411,10 +350,10 @@ async def create_postmortem(
     """Create a postmortem draft for `incident_id`.
 
     Not gated by `require_permission`: this is the persistence half of
-    "trigger draft generation" (PROJECT_PLAN.md section 9.4 -- core/incidents
+    "trigger draft generation" core/incidents
     calls `agents.generate_postmortem`, which returns computed content only;
     core/incidents then persists it, since agents never writes to this table
-    directly). `generated_by` is always `actor.audit_tag`, so whichever
+    directly. `generated_by` is always `actor.audit_tag`, so whichever
     identity triggered this (a human, or eventually `agent:postmortem_agent`)
     is the exact same string recorded as having generated it.
 
@@ -457,39 +396,12 @@ async def trigger_postmortem_generation(
     organization_id: uuid.UUID,
     incident_id: uuid.UUID,
 ) -> Postmortem:
-    """Trigger Postmortem Agent draft generation for `incident_id`
-    (API_DESIGN.md: `POST /incidents/{id}/postmortem`) -- the actual glue
-    `create_postmortem`'s own docstring already describes: calls
-    `agents.generate_postmortem` for computed content, then persists it here
-    via `create_postmortem`, since agents/ never writes to this table
-    directly.
-
-    Guards `create_postmortem` itself deliberately does not (that function
-    is the reusable persistence primitive; these are specific to "a human
-    just asked to generate a draft"):
-      - the incident must be `resolved`/`closed` -- AGENT_WORKFLOWS.md
-        section 2.5: "called after an incident is marked resolved ... this
-        agent does not run automatically on every incident." This is the
-        one function representing that explicit trigger action, so it's the
-        right place to enforce it.
-      - `actor` needs `postmortem:write` -- the same permission code that
-        already gates editing a draft (`update_postmortem`); triggering the
-        initial draft's creation is at least as privileged as editing one.
-      - fails fast, before spending any LLM calls, if a postmortem already
-        exists for this incident -- `create_postmortem` re-checks this too
-        (defense in depth against a race between the two checks), so this
-        is a latency optimization, not the only guard.
-
-    The persisted row's `generated_by` is always `"agent:postmortem_agent"`
-    (AGENT_WORKFLOWS.md section 2.5), not `actor.audit_tag`: `actor` is the
-    human who *triggered* generation, not who *wrote* the draft's content,
-    so `create_postmortem` is called here with a separate
-    `Identity.for_agent("postmortem_agent", organization_id)` -- the same
-    pattern `ingestion.service.run_ingestion_job` uses for its own internal,
-    agent-attributed writes. The human's own role is recorded as its own
-    audit event (`postmortem.generate_requested`) instead, so the audit
-    trail honestly shows both facts: who asked for a draft, and that the
-    agent is what actually wrote it.
+    """triggers the Postmortem Agent to generate a draft for an incident and saves it to 
+    the database. It only runs if the incident is resolved or closed, the user has 
+    `postmortem:write` permission, and no postmortem already exists. It checks for an 
+    existing postmortem before making costly AI calls. The draft is attributed to the 
+    Postmortem Agent, while a separate audit event records which human requested it, 
+    keeping responsibility clear.
     """
     _ensure_same_organization(actor, organization_id)
     incident = await _get_owned_incident(session, organization_id, incident_id)

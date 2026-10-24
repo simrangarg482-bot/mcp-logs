@@ -1,14 +1,8 @@
-"""Pydantic contracts for core/knowledge -- the documents proposal/review
-lifecycle (API_DESIGN.md section 1 "Knowledge review queue" / section 3's
-`propose_runbook_update` tool and `document://` resource).
-
-Owned by: core/knowledge. `Document` here mirrors `app.ingestion.schemas.
-Document`'s shape (same underlying `documents` table row) rather than
-importing it -- `core/` may not import `app.ingestion`
-(pyproject.toml's "core does not depend on mcp or ingestion" contract), so
-this module defines its own local read-shape over the shared table, the
-same convention every other `core/` submodule already follows for its own
-tables.
+"""This module defines Pydantic data models for the knowledge document review process, 
+including proposing and reviewing document updates. Its `Document` model matches the 
+existing database document structure but is defined separately to avoid importing 
+`app.ingestion`. This keeps `core/knowledge` independent of the ingestion and MCP 
+modules, following the project's architecture rules.
 """
 
 from __future__ import annotations
@@ -22,7 +16,7 @@ from app.shared.schemas import DocumentStatus
 
 
 class DocumentProposalCreate(BaseModel):
-    """Request body for `propose_document` (API_DESIGN.md section 3's
+    """Request body for `propose_document`
     `propose_runbook_update` MCP tool: `{title, content, source_incident_id?}`).
 
     `project_id` is optional and not part of that documented tool contract,

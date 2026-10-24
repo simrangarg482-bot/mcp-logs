@@ -1,10 +1,10 @@
 """SQLAlchemy model for `knowledge_graph_edges` -- the derived relationship
-layer (Priority 5).
+layer.
 
 Owned by: database/ (definition) + core/graph (write access).
 
 WHAT THIS TABLE IS, AND EMPHATICALLY IS NOT
-    It stores *relationships between existing entities*, never entity
+    It stores relationships between existing entities, never entity
     content. There is no title, description, document text or postmortem body
     here -- only `(entity_type, entity_id)` references whose source of truth
     remains `incidents`/`postmortems`/`documents`/`projects`. That is what
@@ -47,7 +47,7 @@ TENANT ISOLATION
     Carries `organization_id` directly, so migration `a7b8c9d0e1f2` can put
     it in the same `tenant_isolation` RLS policy set as every other
     direct-`organization_id` table (`c7d4e8f19a2b`). `project_id` is a
-    denormalized *hint* for query narrowing only -- it is never the
+    denormalized hint for query narrowing only -- it is never the
     authorization boundary. Authorization is decided by resolving each
     endpoint entity against its own live row and permission rules (see
     `core.graph.service`), because an edge's own columns cannot know whether

@@ -1,40 +1,12 @@
-"""Public interface for core/users -- identity resolution and authorization.
-
-Owned by: core/users. This module is the authority on who a user is and what
-they may do. It resolves persisted role assignments into an `Identity`
-(consumed everywhere) and provides `authorize()` / `require_permission()` --
-the checks that make REST and MCP access control identical (ARCHITECTURE.md
-section 6; API_DESIGN.md section 2).
-
-Design notes:
-  - `resolve_identity` is the ONLY sanctioned way to build a user `Identity`
-    (see the deliberate absence of an `Identity.for_user` constructor): it
-    guarantees the permission set is actually loaded, so an identity can never
-    silently carry empty/incorrect permissions.
-  - `authorize` is intentionally pure (no session): once an identity is
-    resolved, every permission check is an in-memory set-membership test. This
-    is what lets the same identity be checked cheaply many times per request.
-  - Multi-tenancy (PROJECT_PLAN.md section 3.5-3.6): every identity is
-    resolved *within* one organization, so `resolve_identity` and
-    `get_user_profile` both now require `organization_id` -- there is no
-    "resolve a user" operation that isn't also "resolve them for this
-    organization." `authorize`/`require_permission` additionally accept an
-    optional `project_id` for the finer-grained project-scoped check; omitting
-    it preserves the original, cheaper org-level-only check.
-  - Project-level permission *resolution* (populating
-    `Identity.project_permissions` from `project_memberships`) is now wired
-    up: `resolve_identity` loads it via `repository.get_project_permission_map`
-    in the same fixed-number-of-queries shape as the org-level `roles`/
-    `permissions` lookups. `has_permission` already supported a `project_id`
-    argument before this landed, so this was purely additive -- no other
-    module's call sites needed to change to start getting real project-scoped
-    enforcement (see `core.incidents.service`, whose `require_permission(...,
-    project_id=...)` calls predate this and were, until now, silently always
-    falling back to the org-level check for every caller).
-  - `require_project_permission` is a thin, explicitly-named wrapper around
-    `require_permission` for call sites that are *always* project-scoped
-    (never optionally) -- it changes no enforcement behavior, only readability
-    at the call site.
+"""This is the central authority for user identity and permissions in EKIP. 
+`resolve_identity` loads a user's roles and permissions for a specific organization and 
+builds their `Identity`; it is the only approved way to create one. Once the identity 
+is loaded, `authorize()` and `require_permission()` check permissions quickly in memory, 
+ensuring REST APIs and MCP tools follow the same access-control rules. The module also 
+supports project-level permissions: when a `project_id` is provided, it checks 
+permissions for that project; otherwise, it performs the organization-level check. 
+`require_project_permission()` is simply a clearer wrapper for operations that always 
+require project-level authorization.
 """
 
 from __future__ import annotations
@@ -74,41 +46,16 @@ def _ensure_same_organization(actor: Identity, organization_id: uuid.UUID) -> No
 async def resolve_identity(
     session: AsyncSession, user_id: uuid.UUID, organization_id: uuid.UUID
 ) -> Identity:
-    """Build a fully-populated `Identity` for a user, scoped to
-    `organization_id`.
-
-    Loads the user row plus their role names and flattened permission codes
-    *within that organization* (PROJECT_PLAN.md section 3.5), in a small fixed
-    number of indexed queries. Raises:
-      - NotFoundError if no such user exists.
-      - PermissionDeniedError if the user exists but is deactivated (a
-        disabled account must never yield a usable identity).
-
-    A user with no role assignment in `organization_id` resolves successfully
-    to an Identity with empty `roles`/`permissions`, rather than raising here:
-    every downstream `authorize()` check then fails closed for them, which is
-    the safe behavior. Verifying that a user is actually a *member* of
-    `organization_id` at all (vs. simply having zero permissions there) is a
-    login-time concern for core/auth (PROJECT_PLAN.md section 3.3), not
-    something this resolver re-derives.
-
-    This is the resolver that core/auth calls after it has verified a
-    credential/token and determined which organization the session is scoped
-    to; auth never reads roles/permissions itself.
-
-    Milestone 10 RLS note: `user_roles` (and the tables `get_role_names`/
-    `get_permission_codes` join through it) is RLS-protected -- and,
-    critically, this function is what runs *before* `app.api.deps.
-    get_current_identity`/`app.mcp.dispatch.run_mcp_tool` get a chance to
-    call `set_tenant_context` themselves (both call it only *after*
-    `resolve_identity` already returned). Since `organization_id` is already
-    a required parameter here -- unlike the genuine bare-id chicken-and-egg
-    cases elsewhere in Milestone 10 -- the fix is simply to set the GUC
-    here, first, rather than waiting for a caller further up the stack.
-    Without this, every single request's role/permission lookup would
-    silently return empty sets under RLS (not an error -- an `Identity`
-    with zero permissions, failing every `authorize()` check closed) rather
-    than the caller's real roles.
+    """This function builds a fully populated `Identity` for a user within a specific 
+    organization by loading their user record, roles, and permissions. It raises 
+    `NotFoundError` if the user doesn't exist and `PermissionDeniedError` if their 
+    account is disabled. If the user has no roles in that organization, it returns an 
+    identity with empty permissions, so authorization checks safely deny access. An 
+    important security detail: because role and permission tables are protected by 
+    Row-Level Security (RLS), the function must set the organization context before 
+    querying them; otherwise, valid permissions could appear empty. The authentication 
+    module calls this function after verifying the user's credentials and determining 
+    their organization.
     """
     await set_tenant_context(session, organization_id)
 
@@ -188,15 +135,12 @@ async def list_organization_members(
     session: AsyncSession, actor: Identity, organization_id: uuid.UUID
 ) -> list[OrganizationMember]:
     """List every user holding a role in `organization_id`, with their role
-    names -- backs `GET /organizations/{id}/members` (Phase 2's fix for the
-    frontend's Users settings page, which previously called a `GET /users`
-    endpoint that never existed on the backend at all).
+    names -- backs `GET /organizations/{id}/members`.
 
     No `require_permission` gate beyond organization membership itself:
     seeing your own teammates' names, emails, and roles is ordinary within
     an organization (needed for e.g. deciding who to loop into an incident),
     unlike `core.tenancy.service.list_invitations`/`list_access_rules`
-    (Phase 1's fix), which expose configuration data, not who's on the team.
     """
     _ensure_same_organization(actor, organization_id)
     rows = await repository.list_organization_members(session, organization_id)
@@ -284,8 +228,7 @@ def authorize(
     onto the identity. With no `project_id`, checks the org-level set only
     (identical behavior to before this migration). With a `project_id`, checks
     that project's override if one exists, else falls back to the org-level
-    set (PROJECT_PLAN.md section 3.6). This is the boolean form (API_DESIGN.md
-    section 2); use `require_permission` when a denial should abort the
+    set. This is the boolean form use `require_permission` when a denial should abort the
     operation.
     """
     return actor.has_permission(permission_code, project_id=project_id)

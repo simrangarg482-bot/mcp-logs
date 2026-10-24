@@ -67,7 +67,7 @@ async def list_incidents(
     session: AsyncSession, organization_id: uuid.UUID, query: IncidentFilter
 ) -> Sequence[Incident]:
     """Return incidents belonging to `organization_id`, newest first,
-    filtered/paginated per `query` (API_DESIGN.md: `GET /incidents`).
+    filtered/paginated per `query`.
     """
     stmt = select(Incident).where(Incident.organization_id == organization_id)
 
@@ -241,9 +241,8 @@ async def insert_postmortem(
     action_items: list[dict],
     generated_by: str,
 ) -> Postmortem:
-    """Create one postmortem row (always `status="draft"`, per
-    AGENT_WORKFLOWS.md section 2.5: a postmortem draft is never treated as
-    final regardless of how it was generated) and return it with server
+    """Create one postmortem row a postmortem draft is never treated as
+    final regardless of how it was generated and return it with server
     defaults populated.
     """
     row = Postmortem(
@@ -291,8 +290,7 @@ async def list_postmortems_by_organization(
     """Return the most recent postmortems for `organization_id` whose
     `status` is in `statuses`, newest first.
 
-    Backs the Investigation Agent's "existing postmortems" evidence source
-    (AGENT_WORKFLOWS.md section 2.4 / PROJECT_PLAN.md section 6.4) -- there
+    Backs the Investigation Agent's "existing postmortems" evidence source there
     is no embedding-based search over postmortems (`retrieval_models.py`'s
     own module docstring: no "incidents"/postmortem collection exists yet),
     so this is a plain recency-ordered list, not a relevance-ranked one.

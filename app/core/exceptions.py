@@ -1,8 +1,16 @@
 """Domain error types raised by the core/ service layer.
 
-Owned by: core/. These are transport-agnostic: a service raises `NotFoundError` or `PermissionDeniedError` without knowing whether the caller arrived over REST or MCP. The api/ and mcp/ boundary layers each catch `EKIPError` and translate `.error_code` / `.status_hint` into their own protocol -- an HTTP status code, or an MCP error response -- so REST and MCP share one set of error semantics (ARCHITECTURE.md section 6).
+These are transport-agnostic: a service raises `NotFoundError` or `PermissionDeniedError`
+ without knowing whether the caller arrived over REST or MCP. The api/ and mcp/ boundary
+layers each catch `EKIPError` and translate `.error_code` / `.status_hint` into their 
+own protocol -- an HTTP status code, or an MCP error response -- so REST and MCP share 
+one set of error semantics.
 
-Why a small explicit hierarchy rather than raising built-ins (ValueError, KeyError): the boundary layer needs a stable, machine-readable `error_code` and a status mapping that does not depend on guessing from a built-in type. Keeping the mapping on the exception (via `status_hint`) means the transport layer stays a thin translation with no per-error `if isinstance(...)` ladder.
+Why a small explicit hierarchy rather than raising built-ins (ValueError, KeyError):
+the boundary layer needs a stable, machine-readable `error_code` and a status mapping 
+that does not depend on guessing from a built-in type. Keeping the mapping on the 
+exception (via `status_hint`) means the transport layer stays a thin translation with no
+per-error `if isinstance(...)` ladder.
 """
 
 from __future__ import annotations

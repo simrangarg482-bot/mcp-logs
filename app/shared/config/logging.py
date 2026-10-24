@@ -30,16 +30,6 @@ import structlog
 
 from app.shared.config.settings import get_settings
 
-# Phase 5.1: a defensive safety net, not the primary control -- every
-# call site in this codebase already follows the convention of logging
-# summaries/ids rather than raw secrets (see e.g. app/core/observability's
-# module docstring on why `mcp_requests.request_summary` never stores raw
-# payloads). This processor exists for the case that convention is missed:
-# any event-dict key whose *name* looks secret-shaped has its value replaced
-# outright, regardless of what the value actually contains. Matched
-# case-insensitively and against substrings (not just exact names) so
-# `authorization_header`/`client_secret_ref`/`jwt_token` are all caught, not
-# just literal `password`/`token`/`secret`.
 _SENSITIVE_KEY_PATTERN = re.compile(
     r"(password|token|secret|api_key|apikey|authorization|credential|client_secret|private_key)",
     re.IGNORECASE,

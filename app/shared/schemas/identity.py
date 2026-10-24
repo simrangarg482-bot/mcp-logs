@@ -1,35 +1,10 @@
-"""The `Identity` value object threaded through every cross-module call.
-
-Owned by: shared/ (ARCHITECTURE.md section 3). This is the single most
-load-bearing shared type in the system: API_DESIGN.md section 2 threads
-`Identity` through every `core/` and `agents/` public call precisely so that
-access control is identical regardless of entry point -- the same
-`authorize()` check runs whether a request arrived over REST or MCP
-(ARCHITECTURE.md section 6).
-
-It is deliberately transport-agnostic: it carries *who* the caller is and
-*what* they're allowed to do, with no knowledge of JWTs, MCP tokens, or HTTP.
-Resolving a raw credential into an `Identity` is core/auth/'s job; everything
-downstream just receives the resolved object.
-
-Multi-tenancy (PROJECT_PLAN.md section 3.4-3.6): an `Identity` is scoped to
-exactly one organization -- there is no global, org-less identity in this
-system. `organization_id` is the claim every session token carries (section
-3.4) and the value every downstream query filters by (section 3.7); making it
-a required field here, rather than an optional add-on, is what makes
-"resolve this user's identity" and "resolve this user's identity within this
-organization" the same operation -- there is no other kind to accidentally
-fall back to.
-
-`project_permissions` is the extension point for the second, finer-grained
-authorization tier (section 3.6): a project-scoped role can override the
-identity's org-level `permissions` for a specific project. `core/users/
-service.py`'s `resolve_identity` populates it from `project_memberships` via
-`repository.get_project_permission_map` -- see that module's docstring for
-the resolution query. It defaults to empty here only for identities built
-without going through `resolve_identity` (e.g. `Identity.for_agent`, or a
-user with no project memberships), in which case `has_permission` falls back
-to the org-level `permissions` set for every project, per section 3.6.
+"""`Identity` is a shared object that carries who the caller is, which organization they
+ belong to, and what permissions they have. It keeps authorization consistent across 
+ REST, MCP, `core/`, and `agents/` because every module receives the same resolved 
+ identity instead of handling tokens or HTTP details itself. Every identity must belong 
+ to exactly one organization, while `project_permissions` provides finer-grained 
+ permissions for individual projects. If no project-specific permissions are populated, 
+ the system falls back to the identity’s organization-level permissions.
 """
 
 from __future__ import annotations
@@ -63,7 +38,7 @@ class Identity(BaseModel):
     via the caller's roles *within `organization_id`* (resolved once by
     core/users/), so downstream `authorize()` checks are a pure set-membership
     test with no further database access. `project_permissions` holds any
-    project-scoped overrides, keyed by project id (section 3.6) -- a project
+    project-scoped overrides, keyed by project id -- a project
     absent from that mapping simply has no override.
     """
 
@@ -77,7 +52,7 @@ class Identity(BaseModel):
     # agent name -- whatever uniquely identifies this caller of `kind`.
     subject: str
     # The organization this identity is scoped to. Required, not optional:
-    # per PROJECT_PLAN.md section 3.4/3.7, a session -- and therefore every
+    # a session -- and therefore every
     # resolved Identity -- belongs to exactly one organization; there is no
     # "global" Identity to construct without one.
     organization_id: uuid.UUID

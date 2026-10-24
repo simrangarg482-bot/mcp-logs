@@ -1,28 +1,11 @@
-"""Public interface for core/audit.
-
-Owned by: core/audit. This is the module's contract (API_DESIGN.md section 2:
-`record_audit_event`). Business rules and ORM->Pydantic mapping live here;
-raw SQL lives in repository.py; the wire/HTTP concerns live in the future
-api/ and mcp/ layers.
-
-Transaction model: the session is a parameter, not created here. Callers pass
-the session that is already running their domain mutation, so the audit row
-and the change it describes are one atomic unit -- if the domain write rolls
-back, so does its audit entry, and vice versa. This is why services take a
-session rather than opening their own via session_scope().
-
-Milestone 3 (PROJECT_PLAN.md section 9.4 / "Milestone 3 -- Incident
-Management") calls for extending this module to carry `organization_id`,
-"largely additive to what already exists": `AuditLog.organization_id` was
-already present on the ORM model (nullable -- see its docstring), but nothing
-in this application layer populated or filtered on it. `record_audit_event`'s
-signature is unchanged -- `organization_id` is derived from `actor.organization_id`
-internally, so none of its existing callers (core/tenancy, core/incidents)
-needed to change. `query_audit_log` did change: it previously took no actor
-and no organization scoping at all, meaning any caller could read every
-organization's audit trail. That gap had gone unnoticed only because nothing
-calls it yet (no API/MCP layer exists); it is closed here before a caller
-ever gets the chance to rely on the unscoped behavior.
+"""This is the main service layer for `core/audit`. It applies business rules, converts
+ database records into Pydantic schemas, and calls `repository.py` for database
+   operations. It receives an existing database session from the caller so the audit 
+   record and the actual change are committed or rolled back together. It also 
+   automatically gets `organization_id` from the actor's `Identity`, ensuring audit 
+   records belong to the correct organization. Previously, `query_audit_log` had no 
+   organization-level restriction, so this update closes that security gap before the 
+   API or MCP layer starts using it.
 """
 
 from __future__ import annotations
@@ -84,8 +67,8 @@ async def record_audit_event(
 ) -> None:
     """Append one entry to the append-only audit trail.
 
-    Called by every mutating core/ operation (API_DESIGN.md section 2). The
-    `actor` string persisted is `Identity.audit_tag` -- the single source of
+    Called by every mutating core/ operation. The `actor` string persisted is 
+    `Identity.audit_tag` -- the single source of
     the `user:<id>` / `agent:<name>` format -- so the recorded actor always
     matches the identity that performed the action. The row's
     `organization_id` is `actor.organization_id` -- every `Identity` in this
@@ -128,14 +111,13 @@ async def query_audit_log(
     every other org-scoped read in this codebase is denied, rather than being
     an oversight waiting for its first caller to exploit it.
 
-    Also requires `audit:read` (Phase 2C addition, once this became a real
-    REST-facing capability -- see `_AUDIT_READ_PERMISSION`'s own comment):
+    Also requires `audit:read`
     the audit trail can reveal every consequential action taken in an
     organization, which is admin-facing information, not something every
     org member should be able to read by default.
 
     Maps ORM rows into `AuditLogEntry` so the transactional ORM objects never
-    cross the module boundary (ARCHITECTURE.md section 2).
+    cross the module boundary.
     """
     _ensure_same_organization(actor, organization_id)
     require_permission(actor, _AUDIT_READ_PERMISSION)

@@ -1,49 +1,11 @@
-"""Public interface for core/auth -- SSO login, session issuance/verification,
-refresh rotation (PROJECT_PLAN.md section 3.3-3.4, section 9.1).
-
-Owned by: core/auth. Depends on core/tenancy (to resolve an organization's SSO
-configuration) and core/users (to resolve/create the mapped user), per
-PROJECT_PLAN.md section 9.1 -- the same cross-submodule dependency pattern
-already used by core/tenancy/service.py (core/users, core/audit).
-
-Status of this file, stated plainly rather than left to be discovered later:
-`_discover_authorization_endpoint` and `_exchange_code_for_claims` are now
-real implementations -- OIDC discovery-document fetching (cached in-process),
-a real token-endpoint exchange via `httpx`, and ID token signature
-verification against the issuer's JWKS via `python-jose`, matching a
-key by its `kid` header. This has NOT been run against a live IdP
-(Entra ID/Okta/Auth0/Google Workspace) -- there is no registered test
-application available to verify it end-to-end, so treat this as
-spec-correct-by-inspection, not battle-tested, until it's actually exercised
-against a real provider.
-
-`_resolve_client_secret` now calls `shared/security`'s envelope-encryption
-helper (PROJECT_PLAN.md section 12.5) to decrypt `SSOConfiguration.
-client_secret_ref`, matching `core.tenancy.service.configure_sso`'s
-encrypt-at-write half of the same split -- this was a real, live gap until
-fixed (the module existed and was already used by `register_connector`/
-`mcp_oauth`, `core/auth` just hadn't been updated to use it), not a design
-decision left open.
-
-Group-claim extraction (`_exchange_code_for_claims`'s `groups` field) checks
-the standard `groups` claim, which Entra ID and Okta commonly populate when
-configured to. Auth0 typically uses a custom namespaced claim instead, and
-Google Workspace does not expose group membership via ID token claims at all
-(it requires a separate Admin SDK call) -- group-based provisioning rules
-(`core/tenancy`'s `rule_type="group"`) will work as-is for Entra ID/Okta-style
-claims and will simply never match for providers that don't send a `groups`
-claim in this shape. This is a known, flagged limitation, not a guarantee of
-uniform four-provider group support.
-
-Just-in-time provisioning (PROJECT_PLAN.md section 3.3, step 6) is now
-delegated, not guessed at here: `_resolve_or_provision_user` asks
-core/tenancy's `evaluate_provisioning` whether a login is allowed to
-provision an account (and which role it should get), then asks core/users to
-actually create/resolve the user and grant that role. This supersedes the
-previous stopgap ("a `users` row with this email already exists" = invited),
-per the SSO-provisioning-policy design recorded in ENGINEERING_DECISIONS.md:
-core/auth verifies authentication and extracts identity claims; it does not
-decide who is allowed to join an organization.
+"""`core/auth` handles SSO login, verifies users' identity tokens, creates sessions,
+and manages token refresh. It works with `core/tenancy` to check the organization's SSO
+and provisioning rules, and `core/users` to find or create the user and assign a role.
+The OIDC login and secret decryption logic are implemented, but login has not yet been
+tested end-to-end with a real identity provider. Group-based provisioning reads only the
+standard `groups` claim, which suitably configured Entra ID or Okta deployments may
+provide. Auth0 custom/namespaced group claims are not extracted, and Google Workspace
+group membership requires a separate Admin SDK integration that is not implemented here.
 """
 
 from __future__ import annotations
@@ -570,10 +532,10 @@ async def _exchange_code_for_claims(
     verification, so a token that passes this call has already been checked
     against all three, not just its signature.
 
-    See this module's docstring for two known, flagged gaps: client secret
-    handling isn't yet backed by real encryption (`_resolve_client_secret`),
-    and `groups` extraction only covers the Entra ID/Okta-style `groups`
-    claim shape, not every provider.
+    Client secrets are decrypted through the shared envelope-encryption
+    helper. Group extraction intentionally reads only the standard `groups`
+    claim; provider-specific custom claims and directory lookups are not
+    implemented here.
     """
     document = await _get_discovery_document(sso_config.issuer_url)
     client_secret = await _resolve_client_secret(sso_config.client_secret_ref)

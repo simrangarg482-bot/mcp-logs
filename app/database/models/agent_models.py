@@ -1,27 +1,4 @@
-"""SQLAlchemy models for the tables owned by agents/: `agent_executions` and,
-as of Milestone 9, `knowledge_gap_reports` (DATABASE_DESIGN.md "agents/ --
-owned tables").
-
-Owned by: database/ (definition) + agents/ (write access) -- same ownership
-discipline as every other models file in this project: only agents/'s
-repository code writes here; every other module reads agent results through
-`agents`' public interface (`answer_question`, `triage_incident`,
-`generate_postmortem`, `detect_knowledge_gaps`, PROJECT_PLAN.md section 9.7),
-never by importing this model directly.
-
-`organization_id` added beyond DATABASE_DESIGN.md's original column list --
-that table definition predates the org-scoping migration (ENGINEERING_DECISIONS.md
-#004) and was never revisited, the same gap `audit_logs` and `ingestion_jobs`
-had before their own equivalent additions. Without it, the Knowledge Gap
-Agent's own query ("recent low-confidence `agent_executions` rows",
-PROJECT_PLAN.md section 6.6 / DATABASE_DESIGN.md's own "why this table
-matters" note) would have no way to scope its clustering pass to one
-organization at a time, silently mixing every tenant's low-confidence queries
-together -- the same class of cross-tenant leak #004 fixed for role
-resolution. Carried directly on the row (not derived solely via a join),
-matching `IncidentTimeline`/`Postmortem`/`IngestionJob`'s convention.
-
-`input_summary` is deliberately JSONB, not the raw prompt/context: per
+"""`input_summary` is deliberately JSONB, not the raw prompt/context: per
 DATABASE_DESIGN.md, "not the full prompt -- a structured summary for
 observability, to avoid storing sensitive full context indefinitely" -- this
 table is an execution-outcome log, not a prompt cache.
@@ -44,15 +21,15 @@ from app.database.session import Base
 
 
 class AgentExecution(Base):
-    """One run of one agent node/graph -- observability record, and the
-    Knowledge Gap Agent's own data source (DATABASE_DESIGN.md: "repeated
-    low-confidence_score executions on similar input_summary topics are the
-    signal that drives documentation-gap recommendations").
-
-    Not an audit-trail table (`core/audit`'s `audit_logs` already covers
-    "who did what, when" for human-auditable actions) -- this is
-    agents-internal execution telemetry: which agent ran, how it was
-    triggered, how confident it was, and whether it succeeded.
+    """agent_executions stores one record for each agent run.
+       It tracks:
+       - Which agent ran and what triggered it.
+       - Its confidence score and whether it succeeded.
+       - A summary of its input.
+       Why? The Knowledge Gap Agent analyzes repeated low-confidence runs on 
+       similar topics to identify missing documentation.
+       Difference: agent_executions tracks agent activity; audit_logs tracks 
+       human-auditable actions — who did what and when.
     """
 
     __tablename__ = "agent_executions"
@@ -91,7 +68,7 @@ class AgentExecution(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    #: Phase 5.4/5.7 (AI usage/cost telemetry). All four `NULL` for any
+    #: (AI usage/cost telemetry). All four `NULL` for any
     #: execution that predates this column, and for any execution whose LLM
     #: call(s) never returned `usage_metadata` (e.g. a mocked/test LLM
     #: response) -- absence here means "not captured," never "zero tokens
@@ -111,32 +88,9 @@ class AgentExecution(Base):
 
 
 class KnowledgeGapReport(Base):
-    """One recommendation produced by the Knowledge Gap Agent (Milestone 9,
-    AGENT_WORKFLOWS.md section 2.6 / PROJECT_PLAN.md section 6.6) --
-    "suggested topic, supporting execution IDs, suggested action."
-
-    Owned by: database/ (definition) + agents/ (write access) -- same
-    convention as `AgentExecution` above; `core/knowledge` reads
-    `related_document_id` indirectly (by id) when a human acts on a report,
-    never by joining into this table directly.
-
-    `topic_embedding` and `supporting_execution_ids` are JSONB, not a native
-    `pgvector` column or a join table: the per-organization row count here
-    is small (a handful of open gaps at a time, not millions), so the one
-    place this embedding is ever compared against another
-    (`app.agents.knowledge_gap.pipeline`'s re-run merge check) does the
-    cosine-similarity comparison in Python against the handful of currently
-    "open" rows, rather than needing a SQL-side vector index built for a
-    scale this table will never reach.
-
-    `status` (`"open"`/`"dismissed"`) is an addition beyond
-    AGENT_WORKFLOWS.md's literal spec, flagged plainly rather than silently
-    added: without some way to close a report, `GET /knowledge/gaps` would
-    show the same recommendation forever, even after a human has already
-    acted on it (created the runbook, updated the document) -- a real
-    usability gap the original spec didn't address. Nothing currently sets
-    `"dismissed"` (no dismiss action is wired up yet); the column exists so
-    that action is additive, not a later breaking schema change.
+    """knowledge_gap_reports stores each recommendation created by the Knowledge 
+    Gap Agent, including the suggested topic, supporting execution IDs, and recommended 
+    action.
     """
 
     __tablename__ = "knowledge_gap_reports"

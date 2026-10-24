@@ -1,34 +1,3 @@
-"""SQLAlchemy models for the multi-tenancy foundation.
-
-Owned by: database/ (definition) + core/tenancy (write access), per
-PROJECT_PLAN.md section 9.2. Only core/tenancy's repository code writes here;
-every other module reads through core/tenancy's public interface, never by
-importing these models directly -- same ownership discipline as
-core_models.py.
-
-These tables did not exist in the original single-tenant design
-(DATABASE_DESIGN.md). They are defined fresh here per PROJECT_PLAN.md
-section 3.2, and are the tables every other tenant-owned table will
-reference (via an `organization_id` foreign key added in a follow-up change
-to core_models.py) once this file lands.
-
-Foreign keys to tables owned by other model files (`users.id`, `roles.id`)
-are written as plain string references (`ForeignKey("users.id")`), not
-Python class imports -- this avoids a circular import between
-tenancy_models.py and core_models.py, since core_models.py will in turn need
-to reference `organizations.id` once tenant columns are added there.
-
-`OrganizationAccessRule` and `Invitation` (added after the initial tenancy
-foundation, see ENGINEERING_DECISIONS.md's SSO-provisioning-policy entry)
-model "who may join this organization" -- the design that replaces the
-temporary "a `users` row with this email already exists" assumption
-core/auth's SSO login previously relied on. Both are core/tenancy-owned,
-consistent with `core/tenancy`'s "organization provisioning rules"
-responsibility -- neither table belongs to core/auth (which only verifies
-authentication) or core/users (which only creates users and manages roles
-once provisioning has already been decided).
-""" 
-
 import uuid
 from datetime import datetime
 
@@ -82,8 +51,7 @@ class Project(Base):
     Every organization has at least one project -- `is_default` marks the
     auto-created "General" project so small customers who don't need
     fine-grained scoping still have a uniform `project_id` on every incident
-    and document, rather than that column being optional (PROJECT_PLAN.md
-    section 3.2).
+    and document, rather than that column being optional
     """
 
     __tablename__ = "projects"
@@ -114,7 +82,7 @@ class SSOConfiguration(Base): #Single Sign-On.
     All four supported providers (Entra ID, Okta, Auth0, Google Workspace)
     speak OIDC, so one row shape handles all of them -- `provider` is just a
     label; `protocol` leaves room for a future SAML-only IdP without a schema
-    change (PROJECT_PLAN.md section 3.3).
+    change.
     """
 
     __tablename__ = "sso_configurations"
@@ -182,8 +150,7 @@ class ConnectorConfig(Base):
     `project_id` is nullable: a connector can be org-wide (e.g. one GitHub
     org covering every team) or scoped to a single project. `credential_ref`
     is, like `SSOConfiguration.client_secret_ref`, a reference into the
-    encrypted secret store -- this table never holds a usable raw credential
-    (PROJECT_PLAN.md section 12.5). `config` holds source-specific settings
+    encrypted secret store -- this table never holds a usable raw credential. `config` holds source-specific settings
     (which Slack workspace, which repos) whose shape genuinely differs per
     source -- JSONB here for the same reason `document_metadata` is EAV-style
     in the original design: fixed columns would force a migration per new
@@ -220,8 +187,7 @@ class ConnectorConfig(Base):
 class ProjectMembership(Base):
     """Grants a user a role within one specific project.
 
-    This is the project-level authorization tier from PROJECT_PLAN.md
-    section 3.6 -- distinct from `user_roles` (organization-level role
+    This is the project-level authorization tier from -- distinct from `user_roles` (organization-level role
     assignment). Reuses the existing `roles` catalog rather than inventing
     project-specific roles, so the same permission vocabulary applies at both
     the organization and project scope.
@@ -298,7 +264,7 @@ class Invitation(Base):
     one email, once -- `grants_role_id` mirrors that table's "which role
     does a match receive" field.
 
-    `token_hash` (Phase 7.5/7.6): `NULL` for every invitation created before
+    `token_hash`: `NULL` for every invitation created before
     this column existed, and for the SSO-auto-provisioned acceptance path,
     which proves identity via the IdP's own signed `id_token` instead and
     never needs a separate token. Populated only by `create_invitation` for

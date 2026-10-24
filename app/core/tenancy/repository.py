@@ -5,9 +5,7 @@ Owned by: core/tenancy. Pure data access, same discipline as
 core/audit/repository.py and core/users/repository.py: each function issues
 one statement and returns ORM rows (or None/a sequence of them). No business
 rules (onboarding-state transitions, "does this slug already exist") and no
-ORM->Pydantic mapping live here -- that's service.py's job
-(ARCHITECTURE.md section 3: infrastructure/persistence holds no business
-logic).
+ORM->Pydantic mapping live here -- that's service.py's job.
 
 Every insert function flushes and refreshes so DB-generated columns (`id` via
 gen_random_uuid(), timestamps via now()) are populated on the returned row;
@@ -70,8 +68,7 @@ async def get_organization_by_slug(
 ) -> Organization | None:
     """Fetch a single organization by its login-URL slug, or None if absent.
 
-    Backs the `/o/{org-slug}/login` lookup in the SSO flow (PROJECT_PLAN.md
-    section 3.3, section 11.1) -- resolving which organization's
+    Backs the `/o/{org-slug}/login` lookup in the SSO flow -resolving which organization's
     `sso_configurations` row to redirect an employee against.
     """
     stmt = select(Organization).where(Organization.slug == slug)

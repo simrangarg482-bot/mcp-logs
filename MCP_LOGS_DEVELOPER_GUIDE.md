@@ -422,7 +422,7 @@ REQUIREMENTS
         │
         ▼
 ARCHITECTURAL DECISIONS
-  D1  Modular monolith with import-linter-enforced boundaries      (R9)
+  D1  Modular monolith with import-linter-enforced boundaries        (R9)
   D2  Connectors behind a Protocol + shared processing pipeline      (R1)
   D3  Separate arq worker process, Redis queue                       (R6)
   D4  Postgres + pgvector + tsvector, hybrid search + RRF            (R2)
@@ -432,7 +432,7 @@ ARCHITECTURAL DECISIONS
   D8  organization_id everywhere + app checks + Postgres RLS         (R5)
   D9  Dedicated ekip_app role: NOSUPERUSER, NOBYPASSRLS              (R5)
   D10 Envelope encryption (AES-GCM DEK, KMS-wrapped)                 (R7)
-  D11 audit_logs / agent_executions / mcp_requests + structlog + OTel (R8)
+  D11 audit_logs / agent_executions / mcp_requests + structlog + OTel(R8)
         │
         ▼
 COMPONENTS
@@ -1182,7 +1182,6 @@ No process could start; every module importing `get_settings` would fail.
 - **Where `configure_logging()` is called:** `scripts/run_api_server.py`, `scripts/run_mcp_server.py`, `scripts/run_ingestion_worker.py`, `scripts/run_knowledge_gap_scan.py`, `app/ingestion/workers/main.py`, `app/agents/workers/main.py`. [CODE VERIFIED by grep] **`app/api/main.py` does not call it.** The Dockerfile's default `CMD ["uvicorn", "app.api.main:app", ...]` and `railway.backend.json`'s `uvicorn app.api.main:app ...` therefore start the API **without** `configure_logging()`, so structlog runs with its defaults: no redaction processor, no JSON renderer. [INFERRED FROM CODE] This is worth knowing when debugging production logs.
 - **`tracing.py`:** `configure_tracing(app)` (API, called in `create_app`) and `configure_worker_tracing(name)` (workers' `on_startup`). With `OTEL_EXPORTER_OTLP_ENDPOINT` set, it imports `opentelemetry.exporter.otlp.proto.grpc...`, but **that exporter package is not in `pyproject.toml` or `uv.lock`** [CODE VERIFIED by grep of uv.lock], so setting the variable would raise `ImportError` at startup [INFERRED FROM CODE]. Default: spans are created and dropped (or printed if `otel_console_exporter_enabled`).
 - **Spans in code:** `retrieval.embed` (embedding.py), `ingestion.fetch_page`, `ingestion.process_item` (ingestion/service.py), plus FastAPI auto-instrumentation.
-
 ---
 
 ### Step 05 — `app/database/session.py`
@@ -1322,6 +1321,205 @@ No reproducible schema; RLS, roles and SQL functions (which exist only in migrat
 
 #### 13. Related files
 `app/database/session.py::_build_engine`, `scripts/migration_status.py`, `docs/operations/migration-recovery.md`, `.github/workflows/main-extra.yml`.
+
+#### Individual file entries for Steps 06–07
+
+The grouped entries above give the shared schema and migration model. These file cards preserve the same sequence while making the purpose and reading focus of each file explicit.
+
+##### `app/database/models/__init__.py`
+
+**Chain:** Step 05 (`Base`) → model modules → Alembic metadata.
+
+1. **Purpose:** Explain why models are divided by owning module instead of kept in one large file.
+2. **Contents:** Ownership and registration conventions; the actual model classes live in the sibling `*_models.py` files.
+3. **Read in this order:** Module docstring, then compare its ownership list with the model imports in `app/database/migrations/base.py`.
+4. **Key detail:** Every model group registers against the one `Base` from `app.database.session`.
+5. **Unlocks:** The model files below and Alembic's complete `Base.metadata`.
+6. **Mental model:** A directory map for the ORM schema, not a repository or service layer.
+7. **Common trap:** Adding a model module without importing it into the Alembic environment can make autogenerate miss its tables.
+8. **Related:** `app/database/session.py`, `app/database/migrations/base.py`.
+
+##### `app/database/models/tenancy_models.py`
+
+**Chain:** Step 05 (`Base`) → organization and project ownership → tenancy services and repositories.
+
+1. **Purpose:** Define the tables that establish tenant, project, connector, identity-mapping, and invitation boundaries.
+2. **Contents:** `Organization`, `Project`, `SSOConfiguration`, `ExternalIdentityMapping`, `ConnectorConfig`, `ProjectMembership`, `OrganizationAccessRule`, and `Invitation`.
+3. **Read in this order:** `Organization` and `Project`; then SSO and external identity; connector configuration; memberships and access rules; invitations.
+4. **Key detail:** Connector configuration and tenant relationships carry organization/project identifiers used by authorization and ingestion.
+5. **Unlocks:** `core.tenancy`, organization selection in auth, and connector setup in ingestion.
+6. **Mental model:** The relational foundation for "which organization and project does this data belong to?"
+7. **Common trap:** These classes define persistence shape, not the service-level policy for who may create or change a row.
+8. **Related:** `app/core/tenancy/service.py`, `repository.py`, and `app/shared/schemas/identity.py`.
+
+##### `app/database/models/core_models.py`
+
+**Chain:** Step 05 (`Base`) + tenancy models → shared identity, incident, and audit records.
+
+1. **Purpose:** Define the core domain tables owned by `core/`.
+2. **Contents:** `User`, `Role`, `Permission`, `RolePermission`, `UserRole`, `Incident`, `IncidentTimeline`, `Postmortem`, and `AuditLog`.
+3. **Read in this order:** Global user and permission catalog; organization membership (`UserRole`); incident and timeline; postmortem; audit log.
+4. **Key detail:** `User` is global and intentionally has no `organization_id`; organization roles belong in `UserRole`. Tenant-owned history uses restrictive foreign keys to avoid accidental cascades.
+5. **Unlocks:** User identity resolution, incidents/postmortems, and audit persistence.
+6. **Mental model:** Long-lived business records and authorization catalog, not authentication-session state.
+7. **Common trap:** A globally defined user is not automatically a member of every organization; membership is represented separately.
+8. **Related:** `app/core/users/`, `app/core/incidents/`, `app/core/audit/`.
+
+##### `app/database/models/auth_models.py`
+
+**Chain:** `core_models.User` → refresh-token persistence → `core.auth`.
+
+1. **Purpose:** Store revocable refresh-token state without storing bearer tokens in plaintext.
+2. **Contents:** `RefreshToken`, its token hash, user/organization references, family identifier, expiry, and revocation timestamps.
+3. **Read in this order:** Module rationale; `RefreshToken` docstring; table indexes and foreign-key actions.
+4. **Key detail:** Tokens in a rotation family can be revoked together when reuse of an already-rotated token is detected.
+5. **Unlocks:** Login persistence, refresh rotation, logout, and token-reuse detection.
+6. **Mental model:** Revocable session state, not the access-token/JWT itself.
+7. **Common trap:** Never query or log a raw refresh token; the stored value is its cryptographic hash.
+8. **Related:** `app/core/auth/service.py`, `repository.py`, and migration `c8f1a4d7e2b3`.
+
+##### `app/database/models/ingestion_models.py`
+
+**Chain:** Tenancy models + Step 05 → source/job/document persistence → ingestion and retrieval.
+
+1. **Purpose:** Represent connector sync jobs and normalized source documents.
+2. **Contents:** `IngestionJob`, `Document`, and `DocumentMetadata`.
+3. **Read in this order:** Job status/progress fields; document identity and versioning; metadata key/value rows and their relationship.
+4. **Key detail:** Documents are idempotently identified by organization, source, external id, and content hash; documents also carry soft-delete and creation/update timestamps.
+5. **Unlocks:** Connector checkpoints, document upserts, metadata joins, and chunk-to-document lookup.
+6. **Mental model:** The canonical record of "what was ingested and from where"; vectors live separately in retrieval tables.
+7. **Common trap:** Soft-deleting a document does not invoke database cascades; derived chunk cleanup is a separate lifecycle concern.
+8. **Related:** `app/ingestion/repository.py`, `service.py`, and `app/retrieval/pgvector/store.py`.
+
+##### `app/database/models/retrieval_models.py`
+
+**Chain:** Ingestion documents + pinned embedding decision → collection chunk tables → vector and lexical search.
+
+1. **Purpose:** Define one pgvector-backed chunk table per searchable collection.
+2. **Contents:** Shared `_ChunkColumns` and `_RepoScopedChunkColumns` mixins, plus `DocumentationChunk`, `CodeChunk`, `ConversationChunk`, and `IncidentChunk`.
+3. **Read in this order:** `_EMBEDDING_DIMENSION`; common columns/indexes; repository-specific columns; concrete table classes.
+4. **Key detail:** All four collections use fixed-width `Vector(384)` embeddings; tenant/project/ACL fields are denormalized on each chunk, and `content_tsv` is generated for lexical search.
+5. **Unlocks:** `PgVectorStore`'s collection-to-model mapping and hard-filtered dense/lexical queries.
+6. **Mental model:** Searchable derived copies of document content, separated by collection.
+7. **Common trap:** Changing model dimension requires synchronized Python constants, a forward migration for every collection table, and re-embedding.
+8. **Related:** `app/retrieval/embedding.py`, `app/retrieval/pgvector/store.py`, migrations `f8698cb5abae` and `d4e5f6a7b8c9`.
+
+##### `app/database/models/agent_models.py`
+
+**Chain:** Agent graph/service → execution telemetry and knowledge-gap persistence.
+
+1. **Purpose:** Store agent execution outcomes and knowledge-gap reports.
+2. **Contents:** `AgentExecution` and `KnowledgeGapReport`.
+3. **Read in this order:** Execution scope and summary fields; indexes; report lifecycle and its organization scope.
+4. **Key detail:** Execution summaries are structured JSONB summaries rather than full prompts; organization scope lets gap detection operate tenant by tenant.
+5. **Unlocks:** Agent history/observability and scheduled knowledge-gap detection.
+6. **Mental model:** Operational records about agent runs and the gaps they surface.
+7. **Common trap:** This is not the human audit log; user actions belong in `AuditLog`.
+8. **Related:** `app/agents/repository.py`, `app/agents/knowledge_gap/`, and migration `a1c3e9f2b7d4`.
+
+##### `app/database/models/mcp_models.py`
+
+**Chain:** MCP request dispatch and OAuth provider → MCP persistence.
+
+1. **Purpose:** Define storage for MCP request telemetry and registered OAuth clients.
+2. **Contents:** `McpRequest` and `OAuthClient`.
+3. **Read in this order:** Request-log fields/index; OAuth client identity and encrypted-secret fields; owning services.
+4. **Key detail:** `mcp_requests` is platform-wide and has no `organization_id`; OAuth clients are persisted so dynamic registration survives process restarts.
+5. **Unlocks:** MCP dashboard aggregates and restart-safe OAuth client registration.
+6. **Mental model:** Protocol integration state, not the core incident or document domain.
+7. **Common trap:** The request log is not tenant-scoped merely because it records a caller identity tag.
+8. **Related:** `app/core/observability/`, `app/core/mcp_oauth/`, migrations `e3f6a1b8d4c9` and `b4c7e2a9f5d1`.
+
+##### `app/database/models/memory_models.py`
+
+**Chain:** Step 18 (embedding) + agent memory contract → permission-aware memory rows.
+
+1. **Purpose:** Persist curated agent memories for later retrieval.
+2. **Contents:** `AgentMemory` with scope, owner/project, content, provenance, status, and embedding fields.
+3. **Read in this order:** Module rationale; `_EMBEDDING_DIMENSION`; table constraints/indexes; scope and provenance fields.
+4. **Key detail:** The embedding shares the memory row so it cannot be orphaned from its source; user- and project-scoped memories retain their authorization context.
+5. **Unlocks:** `core.memory` creation, recall, superseding, and deletion.
+6. **Mental model:** A small, permission-scoped set of durable facts, not a transcript or replacement knowledge base.
+7. **Common trap:** Memory rows use the same embedding model dimension as retrieval chunks and must be migrated in lockstep when it changes.
+8. **Related:** `app/core/memory/service.py`, `repository.py`, and migration `f1a2b3c4d5e6`.
+
+##### `app/database/models/graph_models.py`
+
+**Chain:** Existing domain rows → derived non-FK relationships → graph traversal.
+
+1. **Purpose:** Store knowledge-graph edges that cannot be derived from an existing foreign key.
+2. **Contents:** `KnowledgeGraphEdge` with tenant/project scope, polymorphic endpoint identifiers, relationship, provenance, and status.
+3. **Read in this order:** Module rationale; the model's uniqueness/index constraints; endpoint and provenance fields.
+4. **Key detail:** Entity content is not duplicated in this table; graph resolution re-fetches each endpoint and checks its normal authorization rule.
+5. **Unlocks:** Relationship listing and traversal in `core.graph`.
+6. **Mental model:** A rebuildable index of selected relationships, not a second entity store.
+7. **Common trap:** `project_id` helps narrow queries but is not the authorization boundary.
+8. **Related:** `app/core/graph/service.py`, `contract.py`, and migration `a7b8c9d0e1f2`.
+
+##### `app/database/models/pattern_models.py`
+
+**Chain:** Incident/document signals → deterministic proactive findings → authorized insight resolution.
+
+1. **Purpose:** Persist derived findings and references to their supporting evidence.
+2. **Contents:** `ProactiveFinding` and `ProactiveFindingEvidence`.
+3. **Read in this order:** Finding identity/scope; evidence reference fields and indexes; relationship/cascade behavior.
+4. **Key detail:** Evidence uses polymorphic entity identifiers instead of a foreign key; the service re-resolves each source entity under its own authorization rule.
+5. **Unlocks:** Proactive insight detection and evidence-backed display.
+6. **Mental model:** A compact, derived signal plus pointers to source records, not duplicated source content.
+7. **Common trap:** Detection may be broad, but evidence must be filtered to what the caller can actually access.
+8. **Related:** `app/core/proactive/`, migrations `b1c2d3e4f5a6` and `a4c8e1f3b6d2`.
+
+##### `alembic.ini`
+
+**Chain:** Step 05 database configuration → Alembic script discovery → migration commands.
+
+1. **Purpose:** Tell Alembic where the migration environment and revision files live.
+2. **Contents:** `script_location`, logging configuration, and a placeholder SQLAlchemy URL.
+3. **Read in this order:** `script_location`; then note that runtime settings replace the placeholder.
+4. **Key detail:** The URL in this file is not the deployment's source of truth; `base.py` supplies the configured migration/runtime URL.
+5. **Unlocks:** `alembic revision`, `upgrade`, and `downgrade`.
+6. **Mental model:** Alembic's launch configuration, not a hand-maintained database secret.
+7. **Common trap:** Do not put environment-specific credentials in the tracked placeholder.
+8. **Related:** `app/database/migrations/env.py`, `base.py`, and `app/shared/config/settings.py`.
+
+##### `app/database/migrations/env.py`
+
+**Chain:** `alembic.ini` → required Alembic entrypoint → migration environment.
+
+1. **Purpose:** Provide the literal filename Alembic expects under `script_location`.
+2. **Contents:** A single import of `app.database.migrations.base`.
+3. **Read in this order:** Read the docstring, then inspect the imported module.
+4. **Key detail:** Importing `base` executes its top-level Alembic setup and selects offline or online migration execution.
+5. **Unlocks:** `base.py`; it does not implement a second migration engine.
+6. **Mental model:** A tiny adapter into the real environment module.
+7. **Common trap:** Looking for engine selection or metadata setup in this file will lead you to the wrong place.
+8. **Related:** `app/database/migrations/base.py`, `alembic.ini`.
+
+##### `app/database/migrations/base.py`
+
+**Chain:** `env.py` + all model modules → complete metadata and online/offline migration execution.
+
+1. **Purpose:** Configure Alembic against the project's async engine and declarative metadata.
+2. **Contents:** Model imports; settings/URL setup; offline, online, and synchronous migration callbacks.
+3. **Read in this order:** Model imports and `target_metadata`; URL override; `run_migrations_offline`; engine selection in `run_migrations_online`.
+4. **Key detail:** Online migrations use `migration_database_url` when provided, keeping schema changes on the admin role instead of the restricted application role.
+5. **Unlocks:** Autogenerate and applying the full revision chain.
+6. **Mental model:** The bridge between Alembic, the ORM schema, and the correct database credentials.
+7. **Common trap:** Setting `sqlalchemy.url` is for offline mode; online mode uses an `AsyncEngine` directly.
+8. **Related:** `app/database/session.py`, `app/database/models/`, `docs/operations/migration-recovery.md`.
+
+##### `app/database/migrations/versions/be0234931e65_initial_schema.py`
+
+**Chain:** Step 06 models → first reproducible schema → all later revisions.
+
+1. **Purpose:** Create the foundational EKIP schema on an empty database.
+2. **Contents:** The initial organizations, users/roles, projects, auth, connector, document, ingestion, incident, timeline, postmortem, and audit tables and their indexes/constraints.
+3. **Read in this order:** Revision metadata; `upgrade()` table groups and foreign-key actions; `downgrade()` in reverse dependency order.
+4. **Key detail:** This revision anchors the Alembic history; later revisions layer features onto it rather than replacing it.
+5. **Unlocks:** Every later migration and a fresh `alembic upgrade head`.
+6. **Mental model:** The schema's first versioned snapshot.
+7. **Common trap:** RLS, pgvector, and later feature tables are not all created here; inspect their own revisions.
+8. **Related:** `app/database/models/`, `app/database/migrations/base.py`, and `tests/database/test_migration_coverage.py`.
 
 ---
 
@@ -1621,6 +1819,358 @@ No logins, no token verification; REST and MCP both dead.
 - **`trigger_postmortem_generation`**: requires resolved/closed incident, `postmortem:write`, no existing postmortem; lazily imports `app.agents.service.generate_postmortem` (to avoid a circular import), then persists via `create_postmortem` under `Identity.for_agent("postmortem_agent", org)` so `generated_by` is the agent, and audits the request under the human actor.
 - **Mental model:** "the incident binder": agents may read it and add notes; only humans with the right stamp may sign the postmortem.
 - **Interview:** Why do agents never write postmortems directly? Why is `record_investigation_result` ungated? What was audit finding H4?
+
+#### Individual file entries for Steps 08–15
+
+The sequence-level entries above remain the overview. These file cards break out the individual contracts, services, schemas, and repositories that those steps group together.
+
+##### `app/shared/schemas/__init__.py`
+
+**Chain:** Shared schema modules → stable package-level import surface → cross-module consumers.
+
+1. **Purpose:** Re-export the shared identity, domain vocabulary, and agent contract types.
+2. **Contents:** Imports from `agent_contracts.py`, `common.py`, and `identity.py`, plus the explicit `__all__`.
+3. **Read in this order:** Module ownership docstring; grouped imports; `__all__`.
+4. **Key detail:** Callers can import `Identity` and other common contracts without depending on the internal submodule layout.
+5. **Mental model:** The public index of `app.shared.schemas`.
+6. **Common trap:** Add a new shared public type to `__all__` if package-level imports are the established interface.
+7. **Related:** `common.py`, `identity.py`, `agent_contracts.py`.
+
+##### `app/shared/schemas/common.py`
+
+**Chain:** Step 01 → shared domain vocabularies → service, API, agent, and MCP contracts.
+
+1. **Purpose:** Keep literal values reused across modules in a shared layer rather than making every consumer depend on `core`.
+2. **Contents:** `Severity`, `IncidentStatus`, `PostmortemStatus`, `DocumentStatus`, `ActionItemStatus`, `IngestionJobStatus`, `TriggerSource`, `AgentExecutionStatus`, and `ErrorBody`.
+3. **Read in this order:** Literal aliases first, then the `ErrorBody` `TypedDict` and its transport-boundary rationale.
+4. **Key detail:** These are type-level vocabularies; they do not validate or persist data by themselves.
+5. **Mental model:** The common dictionary of accepted values and error shape.
+6. **Common trap:** Do not redefine a vocabulary in an API or service module; that permits subtly different spellings and status sets.
+7. **Related:** `app/shared/schemas/identity.py`, `agent_contracts.py`, and `app/core/exceptions.py`.
+
+##### `app/shared/schemas/identity.py`
+
+**Chain:** Shared common types → immutable `Identity` → authorization decisions in services.
+
+1. **Purpose:** Represent the authenticated actor and the permissions resolved for the current organization.
+2. **Contents:** `ActorKind` and frozen `Identity`, including `audit_tag`, `has_permission`, and `for_agent`.
+3. **Read in this order:** Required tenant and subject fields; organization/project permission fields; `has_permission`; agent constructor.
+4. **Key detail:** A project-specific permission override replaces the organization-level permission set for that project; it is not unioned with it.
+5. **Mental model:** A request-scoped authorization badge, not a token or a database session.
+6. **Common trap:** `for_agent` deliberately has no user permissions; services must authorize the human actor before delegating privileged writes.
+7. **Related:** `app/core/users/service.py`, `app/core/exceptions.py`, `app/core/audit/service.py`.
+
+##### `app/shared/schemas/agent_contracts.py`
+
+**Chain:** Shared identity and domain vocabulary → typed agent outputs → REST/MCP consumers and incident persistence.
+
+1. **Purpose:** Define stable result contracts that cross the `agents`, `api`, `mcp`, and `core.incidents` boundaries.
+2. **Contents:** `Citation`, `EvidenceItem`, `RootCauseHypothesis`, `InvestigationResult`, `AskResponse`, and `GapReport`.
+3. **Read in this order:** Citation provenance; verified evidence vs. generated hypothesis; investigation review fields; `AskResponse`; gap report.
+4. **Key detail:** Verified evidence and AI-generated hypotheses are separate types and lists, so callers can preserve that distinction structurally.
+5. **Mental model:** The typed envelope for what the agent found and how it knows.
+6. **Common trap:** A hypothesis is not evidence; consumers should preserve `EvidenceItem.reference` relationships and check investigation review status.
+7. **Related:** `app/agents/graph.py`, `app/agents/service.py`, and `app/core/incidents/service.py`.
+
+##### `app/core/audit/repository.py`
+
+**Chain:** Audit schema + tenant session → persistence queries → audit service.
+
+1. **Purpose:** Provide the database-only insert and list operations for audit entries.
+2. **Contents:** `insert` and `list_entries` over `AuditLog`.
+3. **Read in this order:** Insert parameters and row construction; organization-filtered listing and ordering.
+4. **Key detail:** The repository accepts the caller's `AsyncSession`, keeping writes in the caller's transaction.
+5. **Mental model:** A thin persistence adapter, not the place to decide whether the actor may read the log.
+6. **Common trap:** Permission checks and same-organization validation belong in `core.audit.service`.
+7. **Related:** `app/core/audit/service.py`, `schemas.py`, `app/database/models/core_models.py`.
+
+##### `app/core/audit/__init__.py`
+
+**Chain:** Audit package → service/repository modules → core mutation audit calls.
+
+1. **Purpose:** Document ownership and the append-only-by-convention contract of the audit submodule.
+2. **Contents:** A package docstring; it intentionally re-exports no symbols.
+3. **Read in this order:** Read the docstring, then follow the explicit service import path it names.
+4. **Key detail:** Audit callers import `record_audit_event` from `app.core.audit.service`.
+5. **Mental model:** An ownership note, not an API barrel.
+6. **Common trap:** The append-only guarantee is a code convention, not a database-enforced prohibition on updates/deletes.
+7. **Related:** `app/core/audit/service.py`, `repository.py`.
+
+##### `app/core/audit/schemas.py`
+
+**Chain:** Audit model → response/query contracts → audit service and API.
+
+1. **Purpose:** Shape audit rows and optional query filters as typed Pydantic values.
+2. **Contents:** `AuditLogEntry` and `AuditLogQuery`.
+3. **Read in this order:** Public entry fields; query filters and defaults.
+4. **Key detail:** The schema is the service/API contract; it is not the policy enforcement layer.
+5. **Mental model:** The allowed shape of an audit read request and result.
+6. **Common trap:** A schema-level organization identifier does not authorize access to that organization.
+7. **Related:** `app/core/audit/service.py`, `repository.py`, and the audit router in `app/api/routers/tenancy.py`.
+
+##### `app/core/audit/service.py`
+
+**Chain:** Identity + tenant-aware session → authorized audit operations → mutating services and audit API.
+
+1. **Purpose:** Record audit events consistently and expose permission-checked audit queries.
+2. **Contents:** `_ensure_same_organization`, `record_audit_event`, and `query_audit_log`.
+3. **Read in this order:** Organization guard; write function; read permission check; repository call.
+4. **Key detail:** Recording accepts the business operation's session, so the audit event and mutation commit or roll back together.
+5. **Mental model:** The audit policy and orchestration layer over the persistence adapter.
+6. **Common trap:** Do not create a separate transaction for ordinary mutation audit events; it could record a change that rolled back or omit a committed change.
+7. **Related:** `app/core/audit/repository.py`, `schemas.py`, and `app/database/models/core_models.py`.
+
+##### `app/core/users/schemas.py`
+
+**Chain:** Core user/role models → public user and credential shapes → user service and API.
+
+1. **Purpose:** Define typed outputs for permissions, roles, profiles, organization members, and credential lookup.
+2. **Contents:** `Permission`, `Role`, `UserProfile`, `OrganizationMember`, and `UserCredentialLookup`.
+3. **Read in this order:** Small catalog values; profile/member response shapes; credential lookup's intentionally limited fields.
+4. **Key detail:** These contracts keep ORM rows and password hashes from being returned directly to API callers.
+5. **Mental model:** Safe, purpose-specific views of user and authorization data.
+6. **Common trap:** `UserCredentialLookup` is an internal auth input; never serialize its password hash to a client.
+7. **Related:** `app/core/users/service.py`, `repository.py`, and `app/core/auth/service.py`.
+
+##### `app/core/users/__init__.py`
+
+**Chain:** Users package → identity/RBAC service → authentication and protected services.
+
+1. **Purpose:** Document that `core.users` owns persisted user and role resolution.
+2. **Contents:** A package docstring; it intentionally re-exports no symbols.
+3. **Read in this order:** Read the ownership/separation-of-concerns notes; use the named service module for implementation.
+4. **Key detail:** Authentication proves a credential and delegates permission resolution to `core.users`.
+5. **Mental model:** A boundary marker separating "prove who you are" from "what can you do?"
+6. **Common trap:** Import service functions from `app.core.users.service`, not from the package root.
+7. **Related:** `app/core/users/service.py`, `repository.py`, `app/core/auth/service.py`.
+
+##### `app/core/users/repository.py`
+
+**Chain:** Database models + tenant session → user/role persistence operations → user service.
+
+1. **Purpose:** Encapsulate database reads and writes for users, organization roles, permissions, and project memberships.
+2. **Contents:** User lookup/list/insert; role lookup and assignment; permission-code maps; password update; organization-list SQL-function calls; permission/role seeding helpers.
+3. **Read in this order:** User lookups; role/permission joins; project override map; organization-resolution functions; admin-role helpers.
+4. **Key detail:** Organization lists used before tenant context call narrowly scoped database functions designed for that pre-auth situation.
+5. **Mental model:** The data-access half of identity resolution and RBAC.
+6. **Common trap:** Keep authorization decisions in the service; repository functions return data and do not make an actor trusted.
+7. **Related:** `app/core/users/service.py`, `app/database/models/core_models.py`, and migrations `c5e2a9f4d7b3`/`f6a7b8c9d0e1`.
+
+##### `app/core/users/service.py`
+
+**Chain:** Identity contract + user repository → permission resolution/enforcement → auth and every protected service.
+
+1. **Purpose:** Resolve users into request identities and provide shared organization/project permission checks.
+2. **Contents:** `resolve_identity`, profile/member operations, role assignment, `authorize`, `require_permission`, project checks, login organization helpers, and admin-role setup.
+3. **Read in this order:** `resolve_identity`; `authorize`/`require_permission`; `require_project_permission`; login organization lookup; `ensure_admin_role`.
+4. **Key detail:** Identity resolution sets tenant context before querying RLS-protected role data.
+5. **Mental model:** The badge printer and the shared door guard.
+6. **Common trap:** An empty permission set is a deliberate fail-closed result; do not infer organization membership merely from a valid access token.
+7. **Related:** `app/core/users/repository.py`, `schemas.py`, `app/shared/schemas/identity.py`.
+
+##### `app/core/tenancy/schemas.py`
+
+**Chain:** Tenancy models → configuration and lifecycle contracts → tenancy service, API, and connectors.
+
+1. **Purpose:** Validate inputs and define outputs for organizations, projects, SSO, connectors, ingestion runs, access rules, invitations, and provisioning.
+2. **Contents:** Create/output pairs and the event, run-statistics, queue-health, invitation-acceptance, and provisioning decision shapes.
+3. **Read in this order:** Organization/project; SSO and connector config; sync events and run status; access rules; invitations; provisioning decision.
+4. **Key detail:** Connector output schemas redact secret material; create schemas express the input expected by the service.
+5. **Mental model:** Typed admin-console and connector boundary contracts.
+6. **Common trap:** A valid `ConnectorEventTrigger` is not proof of an external provider signature; webhook verification is a separate concern.
+7. **Related:** `app/core/tenancy/service.py`, `repository.py`, and `app/ingestion/schemas.py`.
+
+##### `app/core/tenancy/__init__.py`
+
+**Chain:** Tenancy package → tenant configuration service → authentication and ingestion.
+
+1. **Purpose:** Mark `core.tenancy` as a Python package.
+2. **Contents:** Empty file; behavior lives in the sibling service, repository, and schemas modules.
+3. **Read in this order:** No implementation to read; proceed to `service.py`.
+4. **Key detail:** The empty initializer exposes no implicit package-level API.
+5. **Mental model:** A package marker only.
+6. **Common trap:** Do not assume tenant operations are implemented here.
+7. **Related:** `app/core/tenancy/service.py`, `repository.py`, `schemas.py`.
+
+##### `app/core/tenancy/repository.py`
+
+**Chain:** Tenancy ORM models → organization/configuration persistence → tenancy service.
+
+1. **Purpose:** Provide database operations for organizations, projects, SSO configs, connectors, sync history, access rules, and invitations.
+2. **Contents:** Inserts, scoped lookups/lists, ingestion-run aggregation, sync/checkpoint updates, rule deactivation, and invitation status operations.
+3. **Read in this order:** Organization/project queries; connector persistence and checkpoint updates; access rules; invitation lifecycle.
+4. **Key detail:** Service-level organization checks and permission gates are not replaced by repository filtering.
+5. **Mental model:** SQL-facing operations for the tenant administration domain.
+6. **Common trap:** Be careful with pre-login lookups: only the deliberately public-by-slug path should run before the caller's tenant is known.
+7. **Related:** `app/core/tenancy/service.py`, `schemas.py`, and `app/database/models/tenancy_models.py`.
+
+##### `app/core/tenancy/service.py`
+
+**Chain:** Identity + audit + repository → tenant configuration and connector lifecycle → auth, ingestion, and admin surfaces.
+
+1. **Purpose:** Enforce tenant/admin policy while managing organizations, projects, SSO, connectors, access rules, invitations, and provisioning.
+2. **Contents:** Organization/project operations; encrypted connector/SSO settings; ingestion status/checkpoints; invitation and auto-provisioning policy.
+3. **Read in this order:** Tenant guard and organization creation; connector registration/redaction; SSO configuration; sync/checkpoint methods; invitation/provisioning methods.
+4. **Key detail:** Mutations enforce organization scope and required permissions, and record audit events where applicable.
+5. **Mental model:** The policy-owning façade for tenant administration.
+6. **Common trap:** Connector credentials are persisted encrypted; API-facing results must continue to redact them.
+7. **Related:** `app/core/tenancy/repository.py`, `schemas.py`, `app/shared/security/`, `app/ingestion/service.py`.
+
+##### `app/shared/security/__init__.py`
+
+**Chain:** KMS, envelope encryption, opaque token helpers → shared security import surface.
+
+1. **Purpose:** Re-export the cross-module security primitives from one stable package path.
+2. **Contents:** `KeyManagementService`, KMS implementations/errors, encrypt/decrypt helpers, opaque token generation/hashing, and `__all__`.
+3. **Read in this order:** Module rationale; imports; `__all__`.
+4. **Key detail:** It defines no cryptographic algorithm itself; implementations live in `kms.py`, `envelope.py`, and `tokens.py`.
+5. **Mental model:** A curated public API for shared security utilities.
+6. **Common trap:** Do not treat an exported symbol as evidence that a particular KMS backend is configured; `get_kms()` chooses based on validated settings.
+7. **Related:** `app/shared/security/kms.py`, `envelope.py`, `tokens.py`.
+
+##### `app/shared/security/kms.py`
+
+**Chain:** Settings + cryptographic provider → data-key operations → envelope encryption.
+
+1. **Purpose:** Abstract generation and decryption of data-encryption keys behind a provider-neutral interface.
+2. **Contents:** `KeyManagementService` protocol; local and Azure Key Vault implementations; provider errors; `get_kms`.
+3. **Read in this order:** Protocol; local backend; Azure backend; failure translation; provider factory.
+4. **Key detail:** Envelope encryption uses a data key for the payload and protects that key with a key-encryption key managed by the selected backend.
+5. **Mental model:** The boundary between application encryption and key custody.
+6. **Common trap:** Local KMS is for local/test configurations; production settings reject unsafe local-key use.
+7. **Related:** `app/shared/security/envelope.py`, `settings.py`, and `app/core/tenancy/service.py`.
+
+##### `app/shared/security/envelope.py`
+
+**Chain:** `KeyManagementService` → encrypted credential envelope → tenancy writes and ingestion reads.
+
+1. **Purpose:** Encrypt/decrypt connector secrets without storing plaintext credentials in the database.
+2. **Contents:** `encrypt_secret` and `decrypt_secret`, envelope versioning, nonce handling, and JSON serialization.
+3. **Read in this order:** Version/nonce constants; encryption flow; serialized payload; decryption and version checks.
+4. **Key detail:** The payload includes encrypted key material and authenticated ciphertext; AES-GCM authentication detects tampering.
+5. **Mental model:** A locked box whose key is itself wrapped by the configured KMS.
+6. **Common trap:** Changing the envelope format requires compatibility with already-stored credentials, not just updating the writer.
+7. **Related:** `app/shared/security/kms.py`, `app/shared/security/__init__.py`, `app/ingestion/service.py`.
+
+##### `app/shared/security/tokens.py`
+
+**Chain:** Shared security primitives → opaque one-time tokens → invitation/auth services.
+
+1. **Purpose:** Generate high-entropy opaque tokens and store only a deterministic cryptographic hash of them.
+2. **Contents:** `generate_opaque_token` and `hash_opaque_token`.
+3. **Read in this order:** Entropy/byte-count default; URL-safe encoding; hash function and input handling.
+4. **Key detail:** Callers return the raw value once and persist/compare the hash, so a database disclosure does not reveal a usable token.
+5. **Mental model:** A password-reset-style secret with no recoverable plaintext copy in storage.
+6. **Common trap:** Hash only the token, not a formatted database identifier; validation should compare hashes using the same helper.
+7. **Related:** `app/core/tenancy/service.py`, invitation flows, `app/shared/security/__init__.py`.
+
+##### `app/core/auth/schemas.py`
+
+**Chain:** Auth flows → validated request/response contracts → auth service and API router.
+
+1. **Purpose:** Define the data shapes for SSO, password login, organization choice, session tokens, and verified claims.
+2. **Contents:** SSO redirects/callbacks; signup/login; organization-selection/switching; refresh/logout; token claims; IdP claims.
+3. **Read in this order:** Public request bodies; token/session outputs; organization-selection flow; internal verified claim models.
+4. **Key detail:** Access-token claims and an organization-selection token have different meanings and must not be treated interchangeably.
+5. **Mental model:** The typed vocabulary of the authentication protocol.
+6. **Common trap:** A request schema containing `state` does not prove the server validated it; follow the caller/service path.
+7. **Related:** `app/core/auth/service.py`, `repository.py`, `app/api/routers/auth.py`.
+
+##### `app/core/auth/__init__.py`
+
+**Chain:** Auth package → auth service and persistence → REST/MCP credential flows.
+
+1. **Purpose:** Mark `core.auth` as a Python package.
+2. **Contents:** Empty file; auth behavior is implemented in sibling modules.
+3. **Read in this order:** No implementation to read; continue with `service.py`, then `repository.py` and `schemas.py`.
+4. **Key detail:** The package root re-exports no auth functions.
+5. **Mental model:** A package marker only.
+6. **Common trap:** Keep token issuance and validation in the service rather than adding behavior to the initializer.
+7. **Related:** `app/core/auth/service.py`, `repository.py`, `schemas.py`.
+
+##### `app/core/auth/repository.py`
+
+**Chain:** Auth schemas + persistence models → refresh-token and external-identity operations → auth service.
+
+1. **Purpose:** Encapsulate refresh-token rotation/revocation and external IdP identity mapping queries.
+2. **Contents:** Insert/find refresh token; resolve its organization; revoke one token, a family, or all user sessions; list active tokens; find/insert identity mappings.
+3. **Read in this order:** Token insert/hash lookup; organization-resolution call; revoke/family operations; external identity mapping.
+4. **Key detail:** Organization resolution before normal tenant-scoped queries relies on the dedicated database function described by the migration.
+5. **Mental model:** Auth persistence primitives, with rotation policy owned by the service.
+6. **Common trap:** Never accept or persist a raw refresh token through this repository.
+7. **Related:** `app/core/auth/service.py`, `schemas.py`, migrations `d2e5f8a3c1b6` and `c8f1a4d7e2b3`.
+
+##### `app/core/auth/service.py`
+
+**Chain:** User/tenancy/security services → authentication flows → REST and MCP identity resolution.
+
+1. **Purpose:** Implement password and SSO login, session issuance, refresh rotation, organization switching, and access-token validation.
+2. **Contents:** Password helpers; OIDC discovery/PKCE; signup/invitation acceptance; IdP provisioning; JWT and refresh issuance; logout and organization selection.
+3. **Read in this order:** `verify_access_token`; issue-token/session helpers; refresh and logout; password login/org selection; SSO begin/complete and provisioning.
+4. **Key detail:** JWT validation is stateless; role/permission resolution happens separately through `core.users` on each request.
+5. **Mental model:** The identity proofing and session lifecycle coordinator.
+6. **Common trap:** Access tokens are not individually revoked by logout; refresh-token revocation prevents new access tokens but existing JWTs last until expiry.
+7. **Related:** `app/core/auth/repository.py`, `schemas.py`, `app/core/users/service.py`, `app/core/tenancy/service.py`.
+
+##### `app/core/incidents/schemas.py`
+
+**Chain:** Incident and postmortem models → validated domain contracts → incident service and API.
+
+1. **Purpose:** Define request and response shapes for incidents, timeline entries, action items, and postmortems.
+2. **Contents:** Incident create/read/update/filter; timeline note/entry; action item; postmortem and update schemas.
+3. **Read in this order:** Incident inputs/outputs; list filters; timeline types; action items; postmortem lifecycle and update fields.
+4. **Key detail:** These schemas distinguish API/domain data from ORM state and encode the allowed status vocabularies.
+5. **Mental model:** The typed incident binder forms, separate from the persistence tables.
+6. **Common trap:** Valid schema data is not authorization; service checks still enforce tenant and project permissions.
+7. **Related:** `app/core/incidents/service.py`, `repository.py`, `app/shared/schemas/common.py`.
+
+##### `app/core/incidents/__init__.py`
+
+**Chain:** Incidents package → incident service/repository → REST, agents, MCP, ingestion.
+
+1. **Purpose:** Mark `core.incidents` as a Python package.
+2. **Contents:** Empty file; implementation is in the neighboring incident modules.
+3. **Read in this order:** No implementation to read; continue with `service.py`, `repository.py`, `reads.py`, and `schemas.py`.
+4. **Key detail:** No package-level API is defined by this initializer.
+5. **Mental model:** A package marker only.
+6. **Common trap:** The existence of this file does not mean all incident-related code is owned here; agent generation remains in `app.agents`.
+7. **Related:** `app/core/incidents/service.py`, `repository.py`, `reads.py`, `schemas.py`.
+
+##### `app/core/incidents/repository.py`
+
+**Chain:** Incident ORM models → database operations → incident service.
+
+1. **Purpose:** Persist and query incidents, timelines, and postmortems.
+2. **Contents:** Incident insert/get/list/update; severity-window and ingestion reads; timeline insert/list; postmortem insert/get/list/update.
+3. **Read in this order:** Incident lifecycle; timeline; postmortem; ingestion-specific readers.
+4. **Key detail:** The repository performs database filtering and mapping; permission decisions are enforced in the service before data is returned.
+5. **Mental model:** The SQL adapter for the incident system of record.
+6. **Common trap:** A query filtered by organization is necessary but does not itself decide whether a particular actor may read a project-scoped incident.
+7. **Related:** `app/core/incidents/service.py`, `reads.py`, `schemas.py`.
+
+##### `app/core/incidents/reads.py`
+
+**Chain:** Incident/postmortem records → ingestion-facing read contract → internal content connectors.
+
+1. **Purpose:** Expose narrowly scoped reads of incidents and postmortems for ingestion without letting ingestion own core tables.
+2. **Contents:** `list_postmortems_for_ingestion` and `list_incidents_for_ingestion`.
+3. **Read in this order:** Function parameters and tenant context; selected fields/content assembled for ingestion; ordering/limits.
+4. **Key detail:** This module is a core-owned read boundary used by the incident/runbook ingestion connectors.
+5. **Mental model:** A controlled export lane from core incident data into the standard ingestion pipeline.
+6. **Common trap:** Do not replace this with direct `database.models` access from the connector module.
+7. **Related:** `app/ingestion/connectors/incidents.py`, `runbooks.py`, `app/core/incidents/repository.py`.
+
+##### `app/core/incidents/service.py`
+
+**Chain:** Audit + user permission helpers + repository → incident/postmortem domain policy → agents, REST, MCP.
+
+1. **Purpose:** Enforce tenant/project permissions for incident and postmortem lifecycle operations.
+2. **Contents:** Owned-record guards; incident CRUD/timeline; investigation-result persistence; postmortem generation, review, and approval.
+3. **Read in this order:** Organization/ownership guards; incident permissions; `record_investigation_result`; postmortem trigger and agent delegation; approve/update path.
+4. **Key detail:** The human actor is checked before delegated postmortem generation runs as an agent identity.
+5. **Mental model:** The authoritative gatekeeper for incident records; agents assist, but this service owns writes.
+6. **Common trap:** `record_investigation_result` is an internal agent callback and is not a substitute for an authorized user-facing incident update.
+7. **Related:** `app/core/incidents/repository.py`, `reads.py`, `schemas.py`, `app/agents/service.py`.
 
 ---
 
@@ -1940,6 +2490,442 @@ How do you prevent two workers syncing the same connector? What happens on the t
 
 #### 13. Related
 `app/api/main.py::_lifespan`, `app/api/routers/tenancy.py::sync_connector` / `trigger_connector_event` / replay, `tests/ingestion/test_worker_settings.py`, `tests/ingestion/workers/test_tasks.py`, root `check_arq_queue.py`, `get_arq_job_info.py`, `clear_stuck_locks.py`.
+
+#### Individual file entries for Steps 16–26
+
+The entries below expand the grouped reading steps into file-by-file notes. The existing step overviews remain the orientation and retain the detailed cross-file flows.
+
+##### `app/database/migrations/versions/f8698cb5abae_milestone_5_and_6_retrieval_ingestion_.py`
+
+**Chain:** Initial schema → pgvector retrieval/document chunks and agent tables → retrieval and ingestion.
+
+1. **Purpose:** Create the first retrieval collections and agent execution storage, and add document ACL storage.
+2. **Contents:** Vector extension; `agent_executions`; code, conversation, and documentation chunk tables; `documents.acl_permission_code`; indexes, constraints, and reverse-order downgrade.
+3. **Read in this order:** Revision metadata; `upgrade()` by table; chunk column parity; `downgrade()`.
+4. **Key detail:** Each original chunk table defines `VECTOR(384)`, a generated `content_tsv`, and tenant/project/document constraints.
+5. **Mental model:** The migration that makes documents searchable by both semantic vectors and Postgres full-text search.
+6. **Common trap:** Incidents and later collections are created by subsequent migrations; this revision is not the entire current retrieval schema.
+7. **Related:** `retrieval_models.py`, `ingestion_models.py`, migration `d4e5f6a7b8c9`.
+
+##### `app/retrieval/ranking/fusion.py`
+
+**Chain:** Dense and lexical result lists → reciprocal-rank fusion → hybrid retrieval service.
+
+1. **Purpose:** Merge ranked retrieval lists without assuming their raw scores are on comparable scales.
+2. **Contents:** `_DEFAULT_K` and `reciprocal_rank_fusion`.
+3. **Read in this order:** Function contract; rank contribution calculation; merging/tie handling; `top_k` truncation.
+4. **Key detail:** A result's contribution is rank-based (`1 / (k + rank)`), so a chunk found by both search modes gains support.
+5. **Mental model:** A voting rule over rankings, not a blend of cosine and text-search scores.
+6. **Common trap:** The fused score is useful for ordering, not for interpreting absolute semantic relevance.
+7. **Related:** `app/retrieval/service.py`, `app/retrieval/pgvector/store.py`.
+
+##### `app/retrieval/service.py`
+
+**Chain:** Embedding + vector-store protocol → public hybrid retrieval facade → agents and ingestion.
+
+1. **Purpose:** Provide one API for dense/lexical search, score signals, chunk upsert, and deletion.
+2. **Contents:** Default collection set; `search`, `search_with_signals`, `upsert`, and `delete`.
+3. **Read in this order:** Collection defaults; normal search; signal-preserving search; batch upsert; deletion.
+4. **Key detail:** `upsert` embeds a batch once, then groups chunks by collection before storage; `incidents` is excluded from default all-collection searches.
+5. **Mental model:** The backend-independent coordinator between callers, embedding, ranking, and storage.
+6. **Common trap:** Rank-fusion scores are not confidence scores; use `top_dense_similarity` when downstream logic needs a dense similarity signal.
+7. **Related:** `app/retrieval/embedding.py`, `ranking/fusion.py`, `pgvector/store.py`.
+
+##### `app/retrieval/interfaces/base.py`
+
+**Chain:** Retrieval schemas → backend protocol → pgvector implementation and service wiring.
+
+1. **Purpose:** Define the operations a vector-store backend must provide.
+2. **Contents:** Runtime-checkable `VectorStore` protocol with dense search, lexical search, upsert, and delete.
+3. **Read in this order:** Protocol docstring; signatures; each method's transaction and filter contract.
+4. **Key detail:** The store receives the caller's `AsyncSession`; embedding is deliberately handled by `retrieval.service`, not by the backend.
+5. **Mental model:** An interface boundary that lets storage implementations vary without changing retrieval callers.
+6. **Common trap:** The presence of a protocol does not mean Qdrant is implemented; pgvector is the current backend.
+7. **Related:** `app/retrieval/pgvector/store.py`, `app/retrieval/service.py`, `app/retrieval/schemas.py`.
+
+##### `app/retrieval/pgvector/store.py`
+
+**Chain:** Chunk ORM models + retrieval filters → pgvector/Postgres search implementation → retrieval service.
+
+1. **Purpose:** Implement hard-filtered dense and lexical search and chunk writes/deletes using SQLAlchemy and pgvector.
+2. **Contents:** Collection/model routing; repository filter helper; dense and lexical search (single/all collections); upsert, delete, and optional metadata loading.
+3. **Read in this order:** Collection maps; dense query and score conversion; lexical query; shared filter clauses; union paths; upsert/delete.
+4. **Key detail:** Organization, project, ACL, and soft-deleted-document constraints are applied in SQL before candidate rows are returned.
+5. **Mental model:** The database adapter that searches only the caller's permitted slice of each collection.
+6. **Common trap:** Inner product is negated by pgvector's `<#>` operator; the returned dense score restores the positive cosine-like similarity for normalized vectors.
+7. **Related:** `app/retrieval/interfaces/base.py`, `schemas.py`, `service.py`, `app/database/models/retrieval_models.py`.
+
+##### `app/ingestion/connectors/base.py`
+
+**Chain:** Retrieval contracts → connector protocol → provider adapters and ingestion service.
+
+1. **Purpose:** Specify the structural interface every ingestion source implements.
+2. **Contents:** `Connector` protocol and the expected authenticate/fetch/normalize/close lifecycle.
+3. **Read in this order:** Module boundary statement; protocol members; cursor and resume-token semantics.
+4. **Key detail:** Connectors return source-native items and normalize them into `RawDocument`; shared processing, chunking, embedding, and persistence remain outside the connector.
+5. **Mental model:** An adapter contract at the edge of the ingestion pipeline.
+6. **Common trap:** `normalize` is expected to be deterministic and local; do not move persistence or embeddings into a provider connector.
+7. **Related:** `app/ingestion/schemas.py`, `app/ingestion/service.py`, `app/ingestion/connectors/`.
+
+##### `app/ingestion/schemas.py`
+
+**Chain:** Connector protocol → typed raw/fetched/processed shapes → processors and ingestion service.
+
+1. **Purpose:** Define the data contracts that flow through source fetching and document processing.
+2. **Contents:** `ResolvedConnectorConfig`, `RawDocument`, `FetchResult`, `IngestionJob`, `DocumentMetadataEntry`, `Document`, `Chunk`, `ProcessedDocument`, and `ContentType`.
+3. **Read in this order:** Decrypted connector configuration; source-native document shape; page/cursor result; processed document and chunk fields; job progress.
+4. **Key detail:** Chunks retain offsets into cleaned content so citations can refer back to source text.
+5. **Mental model:** The typed conveyor-belt items from external source to database.
+6. **Common trap:** `credential_ref` in `ResolvedConnectorConfig` is already decrypted at the connector boundary; it is not the persisted encrypted value.
+7. **Related:** `app/ingestion/connectors/base.py`, `processors/`, `app/ingestion/service.py`.
+
+##### `app/ingestion/processors/__init__.py`
+
+**Chain:** Processor package → individual deterministic transforms.
+
+1. **Purpose:** Mark the processor package.
+2. **Contents:** Empty initializer; no processing API is defined at package level.
+3. **Read in this order:** No implementation to inspect; proceed to the named modules.
+4. **Key detail:** The pipeline is in `pipeline.py`, not the package initializer.
+5. **Mental model:** A package marker only.
+6. **Common trap:** Do not infer a shared base class or plugin registry from this empty file.
+7. **Related:** `cleaning.py`, `metadata.py`, `chunking.py`, `pipeline.py`.
+
+##### `app/ingestion/processors/cleaning.py`
+
+**Chain:** `RawDocument` → normalized content → metadata hashing and chunking.
+
+1. **Purpose:** Remove markup/noise and normalize whitespace before content is hashed or embedded.
+2. **Contents:** `clean_content`.
+3. **Read in this order:** Cleanup patterns; transformation sequence; empty/whitespace behavior.
+4. **Key detail:** Downstream hashing and offsets operate on the cleaned text, not the original provider payload.
+5. **Mental model:** A deterministic text-normalization pass.
+6. **Common trap:** Any cleanup change can alter content hashes, document versions, chunk boundaries, and citation offsets.
+7. **Related:** `metadata.py`, `chunking.py`, `pipeline.py`.
+
+##### `app/ingestion/processors/metadata.py`
+
+**Chain:** Cleaned raw content → stable identity and metadata entries → document upsert.
+
+1. **Purpose:** Extract metadata and compute a stable content fingerprint.
+2. **Contents:** `extract_metadata` and `compute_content_hash`.
+3. **Read in this order:** Which source metadata is retained; how keys are represented; hash input and algorithm.
+4. **Key detail:** The content hash is computed after cleaning so irrelevant formatting noise does not create a new version.
+5. **Mental model:** The document's labels plus its deduplication fingerprint.
+6. **Common trap:** Metadata values become persistent searchable-source context; do not add secrets or raw credentials.
+7. **Related:** `app/ingestion/schemas.py`, `pipeline.py`, `app/ingestion/repository.py`.
+
+##### `app/ingestion/processors/chunking.py`
+
+**Chain:** Cleaned content + content type → citation-preserving chunks → embedding/upsert.
+
+1. **Purpose:** Classify content and split it into bounded retrieval units.
+2. **Contents:** Content-type classification, `chunk_document`, boundary finding/slicing, and oversized-piece splitting.
+3. **Read in this order:** Type classification; source-specific strategies; boundary helpers; maximum-size splitting and offsets.
+4. **Key detail:** Code, chat/incident, and prose documents use different boundaries; each result records its position in the cleaned source.
+5. **Mental model:** A type-aware document slicer with a citation coordinate system.
+6. **Common trap:** Changing chunk policy changes index cardinality and retrieval behavior, so validate with retrieval tests/evaluation.
+7. **Related:** `app/ingestion/schemas.py`, `pipeline.py`, `tests/ingestion/processors/test_chunking.py`.
+
+##### `app/ingestion/processors/pipeline.py`
+
+**Chain:** Raw connector document → cleaning, hashing, metadata, classification, chunking → service persistence.
+
+1. **Purpose:** Compose the independent deterministic processors into a `ProcessedDocument`.
+2. **Contents:** `process_document`.
+3. **Read in this order:** Imports; ordered transform calls; final object construction.
+4. **Key detail:** Processing order matters: cleaning precedes both hashing and chunking.
+5. **Mental model:** The assembly line definition for one fetched item.
+6. **Common trap:** Do not reimplement a subset of this sequence in connectors; it would create source-specific behavior.
+7. **Related:** `cleaning.py`, `metadata.py`, `chunking.py`, `app/ingestion/service.py`.
+
+##### `app/ingestion/repository.py`
+
+**Chain:** Ingestion models + tenant-aware session → persistence/checkpoint operations → ingestion service.
+
+1. **Purpose:** Keep database access for connector configs, jobs, documents, and metadata out of the orchestration code.
+2. **Contents:** Tenant-safe connector lookups; job creation/status updates; document identity/version queries; metadata insert/list; truncation of oversized metadata values.
+3. **Read in this order:** RLS bootstrap lookup; connector/job operations; `get_latest_document` and `insert_document`; metadata size guard; metadata reads.
+4. **Key detail:** The repository uses narrow organization-resolution SQL functions for the pre-tenant-context bootstrap, then regular tenant-scoped queries.
+5. **Mental model:** The persistence adapter for the ingestion state machine.
+6. **Common trap:** Keep network calls and retry orchestration out of repository functions.
+7. **Related:** `app/ingestion/service.py`, `app/database/models/ingestion_models.py`, `app/database/session.py`.
+
+##### `app/ingestion/service.py`
+
+**Chain:** Connector configs + processors + retrieval facade → complete sync orchestration.
+
+1. **Purpose:** Run connector syncs end to end with durable progress, idempotency, and bounded failure handling.
+2. **Contents:** Connector registry; job entry points; per-page and per-item processing; checkpoint validation; retries, dead-letter, and status reads.
+3. **Read in this order:** `_execute_ingestion_job`; `_process_one_item`; persist/upsert flow; checkpoint logic; fetch/item retries and failure recording.
+4. **Key detail:** The service owns cross-cutting ingestion behavior so connectors only fetch and normalize; a savepoint isolates a failed item from the rest of the page.
+5. **Mental model:** The orchestrator controlling one connector's durable import state machine.
+6. **Common trap:** New connectors must be registered here and must satisfy the shared cursor, normalization, and cleanup contracts.
+7. **Related:** `app/ingestion/repository.py`, `processors/`, `connectors/`, `app/retrieval/service.py`.
+
+##### `app/ingestion/connectors/__init__.py`
+
+**Chain:** Connector package → provider-specific adapters.
+
+1. **Purpose:** Mark the connector package.
+2. **Contents:** Package initializer; concrete connectors are implemented in sibling modules and registered by the ingestion service.
+3. **Read in this order:** No behavior to inspect; use `base.py` for the protocol and the source module for its implementation.
+4. **Key detail:** The registry is not defined by this file.
+5. **Mental model:** A directory boundary for source adapters.
+6. **Common trap:** Adding a connector module alone does not make the service dispatch to it; add it to the service registry.
+7. **Related:** `app/ingestion/service.py`, `base.py`, all connector modules.
+
+##### `app/ingestion/connectors/github.py`
+
+**Chain:** Connector protocol + GitHub REST API → repository files, commits, pull requests, and issues → documentation/code collections and investigation evidence.
+
+1. **Purpose:** Fetch and normalize multiple kinds of GitHub engineering content using `httpx`.
+2. **Contents:** Auth/client setup; per-repository phase/page cursor; file/commit/PR/issue fetch and normalization paths.
+3. **Read in this order:** Expected repo config; phase/cursor state; full vs incremental fetch; each kind's normalizer; metadata.
+4. **Key detail:** Titles for commits, pull requests, and issues are included in embedded content; metadata preserves kind-specific identifiers and source dates.
+5. **Mental model:** A stateless, paginated GitHub export adapter that turns varied API objects into common documents.
+6. **Common trap:** Repository issues/PRs usually classify as documentation, while source files classify as code; collection comes from content shape/type logic.
+7. **Related:** `app/ingestion/connectors/base.py`, `processors/chunking.py`, `app/agents/investigation/evidence.py`.
+
+##### `app/ingestion/connectors/gitlab.py`
+
+**Chain:** Connector protocol + GitLab API → issue and merge-request documents.
+
+1. **Purpose:** Ingest issues and merge requests from GitLab SaaS or self-managed instances.
+2. **Contents:** Safe base URL validation; PAT client; project/kind/page cursor; normalization and close lifecycle.
+3. **Read in this order:** Client/config; `authenticate`; fetch pagination and `since`; `normalize`; `close`.
+4. **Key detail:** The configured base URL is passed through connector URL safety checks before HTTP requests.
+5. **Mental model:** A GitLab issue/MR adapter with a cursor over configured projects.
+6. **Common trap:** Treat pagination state as opaque and preserve it across `FetchResult.next_cursor`.
+7. **Related:** `app/ingestion/connectors/base.py`, `url_safety.py`, `processors/pipeline.py`.
+
+##### `app/ingestion/connectors/slack.py`
+
+**Chain:** Connector protocol + Slack Web API → channel messages → chat collection.
+
+1. **Purpose:** Fetch message history from configured Slack channel IDs.
+2. **Contents:** `_SlackClient`, Web API authentication, channel/page traversal, message normalization, and client close.
+3. **Read in this order:** Config shape; client wrapper; history pagination; normalization and thread behavior.
+4. **Key detail:** The wrapper carries the channel list because `fetch_batch` receives only the authenticated client, not the original config.
+5. **Mental model:** A channel-by-channel chat history adapter.
+6. **Common trap:** A bot can only read channels its Slack token is authorized to access; configured channel IDs do not grant access.
+7. **Related:** `app/ingestion/connectors/base.py`, `processors/chunking.py`, `app/ingestion/service.py`.
+
+##### `app/ingestion/connectors/teams.py`
+
+**Chain:** Connector protocol + Microsoft Graph → team channel messages → chat collection.
+
+1. **Purpose:** Fetch channel messages through Microsoft Graph using a pre-issued access token.
+2. **Contents:** Team/channel client state; full listing and delta-query incremental paths; per-channel resume state; normalization.
+3. **Read in this order:** Required IDs/token; `supports_resume_token`; full-sync path; delta fetch/resume; normalization.
+4. **Key detail:** Delta links are persisted across sync runs; without an existing link, incremental sync starts a delta walk using the supported modification-time filter.
+5. **Mental model:** A Graph chat adapter whose continuation state can survive beyond one job.
+6. **Common trap:** Do not conflate message creation time with modification time when incremental sync must include edited messages.
+7. **Related:** `app/ingestion/connectors/slack.py`, `sharepoint.py`, `app/ingestion/schemas.py`.
+
+##### `app/ingestion/connectors/jira.py`
+
+**Chain:** Connector protocol + Jira Cloud REST API → project issues → documentation collection.
+
+1. **Purpose:** Poll configured Jira projects and normalize issue content.
+2. **Contents:** Tenant-specific base URL; project-key config; Basic auth; JQL search and opaque page-token state.
+3. **Read in this order:** API/config rationale; authentication; `search/jql` pagination; incremental query; issue normalization.
+4. **Key detail:** Jira's current endpoint uses `nextPageToken`; it does not provide the previous offset/total pagination contract.
+5. **Mental model:** A scheduled-polling issue adapter with server-side JQL filtering.
+6. **Common trap:** Do not switch API versions without accounting for the plain-text versus Atlassian Document Format content representation.
+7. **Related:** `app/ingestion/connectors/confluence.py`, `processors/cleaning.py`, `app/ingestion/service.py`.
+
+##### `app/ingestion/connectors/confluence.py`
+
+**Chain:** Connector protocol + Confluence API/CQL → pages, blog posts, comments, and attachments.
+
+1. **Purpose:** Ingest content from configured Confluence spaces.
+2. **Contents:** Tenant base URL and space keys; CQL pagination; storage-format content; attachment download/extraction and normalization.
+3. **Read in this order:** Config and authentication; CQL query; content-kind normalization; attachment handling; metadata.
+4. **Key detail:** Storage-format markup is cleaned downstream; supported Office/PDF attachments use shared text extraction rather than connector-specific parsers.
+5. **Mental model:** A space-scoped documentation adapter for the Atlassian content hierarchy.
+6. **Common trap:** Unsupported or unextractable attachments should follow the connector's skip/error behavior; do not assume every listed attachment yields text.
+7. **Related:** `app/ingestion/connectors/jira.py`, `app/ingestion/office_extraction.py`, `processors/cleaning.py`.
+
+##### `app/ingestion/connectors/notion.py`
+
+**Chain:** Connector protocol + Notion API → workspace pages → documentation collection.
+
+1. **Purpose:** Search and normalize pages from an authorized Notion workspace.
+2. **Contents:** API-versioned HTTP client; search pagination; archived/trash filtering; page-block content conversion and `RawDocument` output.
+3. **Read in this order:** API version/client; search query; page cursor; page properties and content normalization.
+4. **Key detail:** The connector's configured integration token scopes what the workspace search can return.
+5. **Mental model:** A paginated page export from Notion into the common document format.
+6. **Common trap:** Search results and page content may have separate API calls; read both paths to understand completeness and rate usage.
+7. **Related:** `app/ingestion/connectors/base.py`, `schemas.py`, `processors/pipeline.py`.
+
+##### `app/ingestion/connectors/google_drive.py`
+
+**Chain:** Connector protocol + Google Drive API v3 → files and exported Workspace docs → document collection.
+
+1. **Purpose:** Fetch configured Drive folders and extract supported file contents.
+2. **Contents:** Folder-scoped client; page-token cursor; Google Workspace export MIME mappings; shared Office/PDF text extraction; normalization.
+3. **Read in this order:** Export types; OAuth client; folder and page traversal; file download/export; normalization.
+4. **Key detail:** Google-native documents are exported to text/CSV formats, while supported uploaded Office/PDF formats use shared extraction.
+5. **Mental model:** A folder-scoped Drive crawler that converts provider files into text.
+6. **Common trap:** MIME export support is explicit; an unsupported Google-native or binary type may not yield content.
+7. **Related:** `app/ingestion/office_extraction.py`, `sharepoint.py`, `app/ingestion/schemas.py`.
+
+##### `app/ingestion/connectors/azure_devops.py`
+
+**Chain:** Connector protocol + Azure DevOps WIQL → work items and comments.
+
+1. **Purpose:** Ingest work items from configured Azure DevOps projects.
+2. **Contents:** PAT authentication; WIQL ID query; batched work-item resolution; optional comments; cursor state; normalization.
+3. **Read in this order:** Config and auth; WIQL query; ID batch fetching; comments; normalization and cursor.
+4. **Key detail:** WIQL returns IDs first, so fetching an item page involves querying IDs and then requesting full fields in batches.
+5. **Mental model:** A two-stage query adapter: find matching work-item IDs, then hydrate them.
+6. **Common trap:** Preserve cursor state and keep the server-side changed-date filter aligned with the requested incremental window.
+7. **Related:** `app/ingestion/connectors/jira.py`, `app/ingestion/connectors/base.py`, `processors/cleaning.py`.
+
+##### `app/ingestion/connectors/sharepoint.py`
+
+**Chain:** Connector protocol + Microsoft Graph drive delta → supported site documents.
+
+1. **Purpose:** Ingest files from configured SharePoint site drives.
+2. **Contents:** Site IDs; per-site delta-link state; page/cursor traversal; text/Office/PDF downloads; normalization.
+3. **Read in this order:** Auth and site config; `supports_resume_token`; delta state; content download/extraction; filtering and normalization.
+4. **Key detail:** Graph delta links persist across sync jobs; supported text and selected Office/PDF formats are extracted, while folders and unsupported files are skipped.
+5. **Mental model:** A resumable site-drive crawl driven by Graph's change feed.
+6. **Common trap:** A delta response may need client-side time filtering; do not assume the API accepts a server-side `$filter`.
+7. **Related:** `app/ingestion/connectors/teams.py`, `app/ingestion/office_extraction.py`, `app/ingestion/service.py`.
+
+##### `app/ingestion/connectors/servicenow.py`
+
+**Chain:** Connector protocol + ServiceNow Table API → incidents/knowledge articles.
+
+1. **Purpose:** Fetch configured ServiceNow tables and normalize records as searchable documents.
+2. **Contents:** Instance URL safety check; Basic or bearer auth setup; table/page cursor; record normalization.
+3. **Read in this order:** Required instance config and auth selection; table traversal; `since` filtering; normalization.
+4. **Key detail:** The instance URL is administrator-provided and is validated before the client contacts it.
+5. **Mental model:** A configurable Table API adapter across a small list of record tables.
+6. **Common trap:** Requested table names affect which kinds of records leave the source; validate config and credentials outside the normalization path.
+7. **Related:** `app/ingestion/connectors/url_safety.py`, `schemas.py`, `processors/pipeline.py`.
+
+##### `app/ingestion/connectors/pagerduty.py`
+
+**Chain:** Connector protocol + PagerDuty REST API → service incidents.
+
+1. **Purpose:** Fetch PagerDuty incidents associated with configured services.
+2. **Contents:** Authenticated client; service IDs; offset/page pagination; incremental time filter; incident normalization.
+3. **Read in this order:** Auth and service config; page traversal; time-range parameters; normalized title/description/status metadata.
+4. **Key detail:** The service list scopes the upstream incident query before records are returned to the ingestion pipeline.
+5. **Mental model:** A service-scoped operational incident adapter.
+6. **Common trap:** A connector source being PagerDuty does not itself imply support for monitoring metrics or alert streams beyond the implemented incident API.
+7. **Related:** `app/ingestion/connectors/base.py`, `app/ingestion/schemas.py`, investigation evidence contracts.
+
+##### `app/ingestion/connectors/runbooks.py`
+
+**Chain:** Core-owned postmortem reads → internal connector protocol → documentation retrieval collection.
+
+1. **Purpose:** Re-ingest approved/published postmortems through the ordinary processing and embedding pipeline.
+2. **Contents:** Internal client; short-lived read session; paginated core read; postmortem normalization.
+3. **Read in this order:** Rationale for internal source; session lifecycle; page/cursor behavior; constructed document fields.
+4. **Key detail:** Postmortems become normal documentation chunks so ordinary hybrid search can retrieve them.
+5. **Mental model:** A read adapter that makes existing core records searchable without inventing a second embedding path.
+6. **Common trap:** Its fetch phase opens its own read-only session because the connector protocol does not carry one; writes still use the normal ingestion transaction.
+7. **Related:** `app/core/incidents/reads.py`, `app/ingestion/service.py`, `app/retrieval/service.py`.
+
+##### `app/ingestion/connectors/incidents.py`
+
+**Chain:** Core-owned incident reads → internal connector protocol → explicit incidents collection.
+
+1. **Purpose:** Turn incident records into searchable chunks for historical similarity search.
+2. **Contents:** Internal read session; organization-scoped page cursor; incident normalization; resolution-optional content.
+3. **Read in this order:** Why incidents use the ingestion pipeline; tenant-context/read session; pagination; content and metadata assembly.
+4. **Key detail:** Incidents land in the explicit `incidents` collection and remain outside the default all-collection search.
+5. **Mental model:** The internal incident source adapter feeding the same chunk/embed/store path as external connectors.
+6. **Common trap:** Do not call broad incident service code from this connector if it pulls in the agents module; the narrow `core.incidents.reads` surface avoids that edge.
+7. **Related:** `app/core/incidents/reads.py`, `app/ingestion/connectors/runbooks.py`, `app/retrieval/schemas.py`.
+
+##### `app/shared/rate_limiter.py`
+
+**Chain:** Shared configuration → in-process token-bucket utility → local/background and MCP rate limits.
+
+1. **Purpose:** Provide an async per-key token bucket without a Redis dependency.
+2. **Contents:** `_refill`, blocking `acquire`, and non-blocking `try_acquire`.
+3. **Read in this order:** Capacity/default semantics; refill locking; blocking acquisition; immediate acquisition.
+4. **Key detail:** A local limiter's state is process-local; separate replicas do not share one budget.
+5. **Mental model:** A refillable token balance keyed by a caller-supplied string.
+6. **Common trap:** A zero/negative rate disables limiting in this helper; API quota callers must set explicit capacity to preserve intended bursts.
+7. **Related:** `app/shared/distributed_rate_limiter.py`, `app/ingestion/service.py`, `app/mcp/rate_limit.py`.
+
+##### `app/shared/distributed_rate_limiter.py`
+
+**Chain:** Redis settings + shared limiter contract → cross-process token bucket → workers and API.
+
+1. **Purpose:** Share rate-limit state among processes using an atomic Redis Lua script.
+2. **Contents:** `AsyncRateLimiter`; token-bucket script; Redis `acquire` and `try_acquire`.
+3. **Read in this order:** Script's server-time/refill/consume logic; `_eval_bucket`; blocking worker API; non-blocking request API.
+4. **Key detail:** Worker `acquire` propagates Redis failures; `try_acquire` logs and fails open on Redis connection/timeout errors.
+5. **Mental model:** The same token-bucket algorithm with a shared, atomic Redis state.
+6. **Common trap:** The two acquisition modes intentionally have different outage behavior; changing one should not silently change the other.
+7. **Related:** `app/shared/rate_limiter.py`, `app/shared/redis_settings.py`, `app/api/rate_limit.py`, `app/ingestion/workers/tasks.py`.
+
+##### `app/shared/redis_settings.py`
+
+**Chain:** Validated Redis URL → shared arq/redis connection settings → API and worker pools.
+
+1. **Purpose:** Build Redis connection options consistently for each process.
+2. **Contents:** `build_redis_settings` plus connect timeout, retry count, and exponential-backoff constants.
+3. **Read in this order:** Problem statement; retry/timeout constants; settings construction; retry-on-timeout and error configuration.
+4. **Key detail:** The helper bounds transient connection failures rather than inheriting the too-short arq defaults.
+5. **Mental model:** One connection-policy factory shared by producers and consumers.
+6. **Common trap:** This configures connect/command retries, not every socket read timeout; workers set additional pool settings at startup.
+7. **Related:** `app/api/main.py`, worker `main.py` modules, `app/shared/distributed_rate_limiter.py`.
+
+##### `app/shared/backoff.py`
+
+**Chain:** Shared retry policy → randomized delays → ingestion/agent retries.
+
+1. **Purpose:** Prevent synchronized retry waves by adding full jitter to exponential backoff.
+2. **Contents:** `full_jitter_backoff_seconds`.
+3. **Read in this order:** Function signature; exponential envelope; random selection and bounds.
+4. **Key detail:** Returned delay is uniformly selected from zero through the capped exponential delay.
+5. **Mental model:** A shared timing primitive that spreads retries across callers.
+6. **Common trap:** Callers own their retry count and cap; this helper only computes one delay.
+7. **Related:** `app/ingestion/workers/tasks.py`, `app/agents/retry.py`, `app/agents/workers/tasks.py`.
+
+##### `app/ingestion/workers/main.py`
+
+**Chain:** Ingestion task functions + Redis policy → arq worker settings and startup.
+
+1. **Purpose:** Configure the ingestion worker process and its scheduled reconciliation.
+2. **Contents:** Logging/tracing startup; Redis health/read timeout setup; `WorkerSettings` task, queue, cron, retry, and concurrency configuration.
+3. **Read in this order:** Process-level setup; `_on_startup`; `WorkerSettings` fields; cron reconciliation schedule.
+4. **Key detail:** The worker uses the shared Redis settings and the dedicated ingestion queue.
+5. **Mental model:** The arq deployment configuration for durable background ingestion.
+6. **Common trap:** The API enqueues jobs but does not execute this worker's tasks in-process.
+7. **Related:** `app/ingestion/workers/tasks.py`, `scripts/run_ingestion_worker.py`, `app/api/main.py`.
+
+##### `app/ingestion/workers/tasks.py`
+
+**Chain:** Ingestion service + Redis limiter + arq → task retry/lock boundary.
+
+1. **Purpose:** Turn queue jobs into session-scoped ingestion service calls with cross-process deduplication.
+2. **Contents:** Connector lock acquisition/release; `run_ingestion_job_task`; retry scheduling; dead-letter handling; scheduled reconciliation.
+3. **Read in this order:** Lock token/TTL; task lifecycle; failure and retry branches; lock release; reconciliation enqueue.
+4. **Key detail:** The lock uses an owner token and compare-and-delete Lua release, while the TTL recovers from hard worker death.
+5. **Mental model:** A thin queue adapter around the ingestion service with reliability controls.
+6. **Common trap:** Do not move document-processing logic here; keep it in `app.ingestion.service`.
+7. **Related:** `app/ingestion/workers/main.py`, `app/ingestion/service.py`, `app/shared/backoff.py`.
+
+##### `scripts/run_ingestion_worker.py`
+
+**Chain:** Worker settings → resilient arq process entrypoint → deployment start command.
+
+1. **Purpose:** Start the ingestion worker with a narrow recovery loop for transient Redis polling failures.
+2. **Contents:** `ResilientIngestionWorker`, retryable Redis/watch errors, bounded poll backoff, and `main`.
+3. **Read in this order:** Retryable exception tuple and cap; custom worker override; CLI/worker startup.
+4. **Key detail:** It catches transient polling failures that otherwise could terminate the worker process and retries after bounded delay.
+5. **Mental model:** The production launcher around the standard arq worker settings.
+6. **Common trap:** It is the ingestion worker entrypoint; the agents worker has a separate launch path.
+7. **Related:** `app/ingestion/workers/main.py`, `app/shared/redis_settings.py`, `railway.ingestion-worker.json`.
 
 ---
 

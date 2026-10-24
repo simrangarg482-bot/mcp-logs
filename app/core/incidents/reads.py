@@ -1,27 +1,8 @@
-"""A deliberately narrow, agents-free read surface on top of
-`core.incidents.repository`, for callers outside `core/incidents` that must
-never pull in `core.incidents.service`'s transitive `app.agents.service`
-dependency (its deferred import inside `generate_postmortem`, needed to break
-a genuine circular import between `agents` and `core.incidents` -- see that
-function's own docstring).
-
-`app.ingestion.connectors.runbooks` was the first caller: it needs
-read-only access to approved/published postmortems to re-ingest them as
-searchable content, and nothing else `core.incidents.service` offers.
-Importing `core.incidents.service` for that alone previously made
-`ingestion` transitively depend on `agents`, breaking the "ingestion does
-not depend on agents or mcp" import-linter contract -- Python has no way to
-import only part of a module, so even an unused, function-scoped import
-elsewhere in that file still counts.
-
-`app.ingestion.connectors.incidents.IncidentsConnector` is the second
-caller, for the analogous reason: read-only access to incidents (title +
-description + resolution) to re-ingest them into the `"incidents"`
-retrieval collection.
-
-`core.incidents.service` re-exports both `list_postmortems_for_ingestion`
-and `list_incidents_for_ingestion` from here (rather than duplicating them)
-so every other existing caller keeps working unchanged.
+"""It provides a read-only way to fetch incidents and approved/published postmortems 
+without importing `core.incidents.service`, which indirectly depends on the Agents 
+module. This prevents unwanted dependencies and circular import issues. Ingestion uses 
+it to retrieve incidents and postmortems for search indexing. The main service re-exports 
+these functions so existing callers continue working without changes.
 """
 
 from __future__ import annotations
@@ -43,22 +24,11 @@ async def list_postmortems_for_ingestion(
     offset: int,
     limit: int,
 ) -> list[Postmortem]:
-    """Return approved/published postmortems for `organization_id`,
-    oldest-first, offset-paginated -- backs the Milestone 9 runbooks/
-    incident-report ingestion connector (`app.ingestion.connectors.runbooks`),
-    the source `agents.investigation.evidence`'s own docstring already flags
-    as missing ("no 'postmortems' retrieval collection exists yet").
-
-    Deliberately no `actor: Identity` parameter -- a rare, explicit exception
-    to `core.incidents.service`'s "every function takes an actor" rule, in
-    the same spirit as `core.tenancy.service.list_organizations`/
-    `get_organization_sso_config`: the caller is `ingestion`'s worker, a
-    scheduled system job with no per-request human identity (see
-    `ingestion.service`'s own module docstring: it already constructs
-    `Identity.for_agent("ingestion_worker", organization_id)` purely for
-    audit-tagging, not for permission checks -- there is no permission check
-    to gate here either, matching `list_recent_postmortems`'s "read-only
-    lookup, no require_permission gate" precedent).
+    """It fetches approved or published postmortems for a specific organization, ordered 
+    oldest first, with pagination. It supports the ingestion system in indexing 
+    postmortems so the Investigation Agent can retrieve them as evidence. It doesn’t 
+    require a human identity or check user permissions because it is designed for a 
+    scheduled background worker that performs read-only lookups.
     """
     rows = await repository.list_postmortems_for_ingestion(
         session,

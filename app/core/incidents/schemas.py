@@ -35,7 +35,7 @@ class IncidentCreate(BaseModel):
     """Request body for `create_incident`.
 
     `project_id` is optional: omitting it defaults to the organization's
-    auto-created default project (PROJECT_PLAN.md section 3.2), so a small
+    auto-created default project, so a small
     customer that never bothered creating a second project never has to
     think about `project_id` at all. A caller scoping incidents to a
     specific team's project supplies it explicitly.
@@ -82,8 +82,7 @@ class IncidentUpdate(BaseModel):
 
 
 class IncidentFilter(BaseModel):
-    """Filter + pagination for `list_incidents` (API_DESIGN.md: `GET
-    /incidents`, filterable by `status`, `severity`, `owner_team`). All
+    """Filter + pagination for `list_incidents`. All
     filters optional and AND-combined, mirroring
     `core.audit.schemas.AuditLogQuery`'s existing convention.
     """
@@ -111,7 +110,7 @@ class TimelineNoteCreate(BaseModel):
 
 class TimelineEntry(BaseModel):
     """One chronological entry on an incident, as returned by the read
-    surface (API_DESIGN.md: `GET /incidents/{id}/timeline`).
+    surface.
     """
 
     model_config = ConfigDict(from_attributes=True, frozen=True)
@@ -129,7 +128,7 @@ class TimelineEntry(BaseModel):
 
 
 class ActionItem(BaseModel):
-    """A single postmortem action item (API_DESIGN.md). Local to this
+    """A single postmortem action item. Local to this
     module, not shared/schemas/ -- nothing outside core/incidents references
     it yet.
     """

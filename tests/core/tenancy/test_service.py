@@ -12,7 +12,7 @@ this test suite.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -28,6 +28,7 @@ from app.core.tenancy.schemas import (
     ConnectorConfig,
     ConnectorConfigCreate,
     OrganizationCreate,
+    ProvisioningDecision,
     SSOConfigurationCreate,
 )
 from app.shared.schemas import ActorKind, Identity
@@ -391,6 +392,130 @@ async def test_evaluate_provisioning_sets_tenant_context_before_any_query(monkey
     assert decision.allowed is False
     assert call_order[0] == "set_tenant_context"
     assert "get_pending_invitation" in call_order
+
+
+@pytest.mark.asyncio
+async def test_evaluate_provisioning_assigns_invitation_role_before_domain_or_group(
+    monkeypatch,
+) -> None:
+    organization_id = uuid.uuid4()
+    role_id = uuid.uuid4()
+    invitation_id = uuid.uuid4()
+    invitation = type(
+        "Invitation",
+        (),
+        {
+            "expires_at": datetime.now(UTC) + timedelta(days=1),
+            "grants_role_id": role_id,
+            "id": invitation_id,
+        },
+    )()
+
+    async def fake_set_tenant_context(session, org_id):
+        assert org_id == organization_id
+
+    async def fake_get_pending_invitation(session, org_id, email):
+        assert email == "person@acme.example"
+        return invitation
+
+    async def unexpected_rules(*args, **kwargs):
+        raise AssertionError("invitation match must take precedence")
+
+    monkeypatch.setattr(tenancy_service, "set_tenant_context", fake_set_tenant_context)
+    monkeypatch.setattr(
+        tenancy_service.repository, "get_pending_invitation", fake_get_pending_invitation
+    )
+    monkeypatch.setattr(
+        tenancy_service.repository, "get_active_rules_by_type", unexpected_rules
+    )
+
+    result = await tenancy_service.evaluate_provisioning(
+        None,
+        organization_id=organization_id,
+        email="person@acme.example",
+        groups=("engineering",),
+    )
+
+    assert isinstance(result, ProvisioningDecision)
+    assert result.allowed is True
+    assert result.grants_role_id == role_id
+    assert result.matched_invitation_id == invitation_id
+    assert result.reason == "invitation_match"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("email", "groups", "matching_rule", "reason"),
+    [
+        ("person@acme.example", (), ("domain", "ACME.EXAMPLE"), "domain_match"),
+        ("person@other.example", ("Engineering",), ("group", "engineering"), "group_match"),
+    ],
+)
+async def test_evaluate_provisioning_assigns_matching_rule_role(
+    monkeypatch, email, groups, matching_rule, reason
+) -> None:
+    organization_id = uuid.uuid4()
+    role_id = uuid.uuid4()
+    rule_type, rule_value = matching_rule
+    rule = type("Rule", (), {"value": rule_value, "grants_role_id": role_id})()
+
+    async def fake_set_tenant_context(session, org_id):
+        assert org_id == organization_id
+
+    async def fake_get_pending_invitation(session, org_id, passed_email):
+        return None
+
+    async def fake_get_active_rules_by_type(session, org_id, requested_type):
+        if requested_type == rule_type:
+            return [rule]
+        return []
+
+    monkeypatch.setattr(tenancy_service, "set_tenant_context", fake_set_tenant_context)
+    monkeypatch.setattr(
+        tenancy_service.repository, "get_pending_invitation", fake_get_pending_invitation
+    )
+    monkeypatch.setattr(
+        tenancy_service.repository, "get_active_rules_by_type", fake_get_active_rules_by_type
+    )
+
+    result = await tenancy_service.evaluate_provisioning(
+        None, organization_id=organization_id, email=email, groups=groups
+    )
+
+    assert result.allowed is True
+    assert result.grants_role_id == role_id
+    assert result.reason == reason
+
+
+@pytest.mark.asyncio
+async def test_evaluate_provisioning_denies_when_no_policy_matches(monkeypatch) -> None:
+    async def fake_set_tenant_context(session, org_id):
+        return None
+
+    async def fake_get_pending_invitation(session, org_id, email):
+        return None
+
+    async def fake_get_active_rules_by_type(session, org_id, rule_type):
+        return []
+
+    monkeypatch.setattr(tenancy_service, "set_tenant_context", fake_set_tenant_context)
+    monkeypatch.setattr(
+        tenancy_service.repository, "get_pending_invitation", fake_get_pending_invitation
+    )
+    monkeypatch.setattr(
+        tenancy_service.repository, "get_active_rules_by_type", fake_get_active_rules_by_type
+    )
+
+    result = await tenancy_service.evaluate_provisioning(
+        None,
+        organization_id=uuid.uuid4(),
+        email="person@unmatched.example",
+        groups=("unmatched",),
+    )
+
+    assert result.allowed is False
+    assert result.grants_role_id is None
+    assert result.reason == "no_matching_policy"
 
 
 # --- create_organization (optional actor + audit) -----------------------------

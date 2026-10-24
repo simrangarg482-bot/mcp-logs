@@ -1,24 +1,8 @@
-"""SQLAlchemy models for tables owned by core/auth.
-
-Owned by: database/ (definition) + core/auth (write access), same ownership
-discipline as core_models.py and tenancy_models.py: only core/auth's
-repository.py writes here; every other module reads a user's session state
-through core/auth's public interface, never by importing this model directly.
-
-This table did not exist in DATABASE_DESIGN.md -- that document predates the
-SSO/session redesign in PROJECT_PLAN.md. It is defined fresh here to satisfy
-two requirements stated in PROJECT_PLAN.md but never schema'd:
-  - section 12.1: refresh tokens are "stored hashed, never in plaintext, and
-    revocable."
-  - Milestone 2: `core/auth` is responsible for "refresh rotation."
-
-Foreign keys to `users.id` / `organizations.id` use CASCADE, not this file's
-usual RESTRICT default (see core_models.py's docstring for that default) --
-a deliberate, called-out deviation: a refresh token is ephemeral session
-state with no audit-trail value of its own (unlike an incident or a
-postmortem), so there is no reason a user or organization being removed
-should be blocked by tokens that exist purely to keep that user's browser
-logged in.
+"""Why it exists: To support secure refresh tokens that are stored as hashes, 
+can be revoked, and support refresh-token rotation.
+Cascade deletion: If a user or organization is deleted, 
+its associated refresh-token records are automatically deleted 
+because they are temporary session data, not permanent business records.
 """
 
 import uuid
@@ -32,8 +16,7 @@ from app.database.session import Base
 
 
 class RefreshToken(Base):
-    """One issued refresh token (PROJECT_PLAN.md section 3.4, section 12.1).
-
+    """One issued refresh token 
     Rotation / reuse detection: every refresh token belongs to a `family_id`,
     shared by every token descended from one original login. When a token is
     used, core/auth's service issues a new token *in the same family* and

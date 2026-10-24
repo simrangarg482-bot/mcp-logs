@@ -1,65 +1,23 @@
-"""SQLAlchemy model for `agent_memories` -- persistent, permission-aware
-agent memory (Priority 4).
+"""`agent_memories` stores persistent memories for AI agents, with permissions 
+controlling who can retrieve each memory.
 
-Owned by: database/ (definition) + core/memory (write access) -- the same
-ownership discipline every other models file in this project follows.
-
-WHY THE EMBEDDING LIVES ON THIS ROW, NOT IN A SEPARATE TABLE
-    `embedding` is a `Vector(384)` column on the memory row itself, rather
-    than a `agent_memory_embeddings` child table. This is a direct response
-    to the bug Priority 3 found and fixed (see `docs/DATA_LIFECYCLE.md` §5):
-    a soft-deleted `documents` row left its derived chunk/embedding rows
-    behind in separate tables, and those stayed semantically retrievable --
-    "deleted" content the Answer Agent could still quote. Co-locating the
-    vector with the record makes that failure mode *structurally impossible*
-    here: there is no separate row to leave behind, so deleting or
-    superseding a memory cannot orphan its embedding. It is the same row.
-
-    This is affordable specifically because memory is low-volume and
-    single-chunk by construction (`_MAX_CONTENT_LENGTH` below), unlike
-    documents, which are split into many chunks per source and therefore
-    genuinely need a child table.
-
-WHY NOT REUSE THE EXISTING CHUNK TABLES
-    `documentation_chunks`/`code_chunks`/`conversations_chunks` all require a
-    non-null `document_id` (`ON DELETE CASCADE` to `documents`), and they are
-    organization-wide knowledge with no concept of a private owner. A memory
-    has no document, and a user-scoped memory must be invisible to everyone
-    but its owner. Forcing memory into those tables would mean inventing a
-    fake parent document *and* mixing user-private rows into the org-wide
-    knowledge corpus -- exactly the "memory becomes a second, unrestricted
-    knowledge base" outcome to avoid.
-
-TENANT ISOLATION
-    Carries `organization_id` directly (not derived via a join), matching the
-    `IncidentTimeline`/`Postmortem`/`IngestionJob`/`*_chunks` convention, so
-    the Row-Level Security policy added by migration `f1a2b3c4d5e6` can check
-    it without reaching into another table. That migration adds this table to
-    the same `tenant_isolation` policy set as every other direct-`organization_id`
-    table (`c7d4e8f19a2b`).
-
-FOREIGN KEY CHOICES, AND WHY EACH ONE
-    `organization_id` RESTRICT -- content-table convention (`documents`,
-    `incidents`): an organization's memory must not silently vanish as a side
-    effect of some other delete.
-
-    `owner_user_id` CASCADE -- defense in depth. Priority 3 anonymizes the
-    `users` row rather than deleting it (three RESTRICT FKs make deletion
-    impossible), so in practice this cascade never fires and
-    `core.privacy.service` deletes user-scoped memory explicitly. The
-    CASCADE exists so that IF a `users` row is ever genuinely removed, its
-    private memory cannot survive as an orphan -- never relied upon as the
-    only mechanism.
-
-    `project_id` SET NULL -- matches `connector_configs.project_id`. A
-    project-scoped memory whose project disappears must not keep a dangling
-    reference; `core.memory.repository`'s retrieval requires a non-null
-    `project_id` for `scope="project"`, so such a row becomes unretrievable
-    (fails closed) rather than leaking to every project.
-
-    `supersedes_memory_id` SET NULL -- the provenance link is useful but not
-    load-bearing; losing it must never block deleting the older memory it
-    points at.
+- Embedding on the same row: The memory text and its vector embedding are stored together
+. Deleting a memory therefore cannot leave behind a separate, searchable embedding.
+- Separate from chunk tables: Memories can be private to a user, unlike the existing 
+document chunks, which are organization-wide knowledge.
+- Tenant isolation: `organization_id` lets PostgreSQL RLS ensure one organization's 
+memories aren't accessed by another.
+- Foreign key behavior:
+  - `organization_id → RESTRICT`: prevents deleting an organization while its memories 
+  remain.
+  - `owner_user_id → CASCADE`: if the user is truly deleted, their memories are deleted 
+  too.
+  - `project_id → SET NULL`: if a project is deleted, the memory becomes unretrievable 
+  at project scope.
+  - `supersedes_memory_id → SET NULL`: deleting an older memory doesn't require deleting 
+  the newer one.
+In short: This table gives agents durable, searchable memory without allowing private 
+memories to leak or deleted memories to remain retrievable.
 """
 
 import uuid

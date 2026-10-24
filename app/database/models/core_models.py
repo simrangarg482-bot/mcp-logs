@@ -1,36 +1,3 @@
-"""SQLAlchemy models for tables owned by core/.
-
-Owned by: database/ (ARCHITECTURE.md section 3 -- database/ holds every
-table's definition, but per DATABASE_DESIGN.md's ownership convention, only
-core/'s repository.py files are permitted to write to these tables; other
-modules read through core/'s public interface, never by importing these
-models directly).
-
-Tables here match DATABASE_DESIGN.md's "core/ -- owned tables" section:
-users, roles, permissions, role_permissions, user_roles, incidents,
-incident_timeline, postmortems, audit_logs.
-
-Multi-tenancy (PROJECT_PLAN.md section 3): every table that stores data
-belonging to a specific company carries `organization_id`. Deliberate
-exception -- `users`: a user is a global person record, not pinned to one
-company. Which company a person belongs to, and with what role, is recorded
-on `UserRole` instead (organization_id lives there, not here) -- this is what
-lets one person hold a different role in two different companies
-(PROJECT_PLAN.md section 3.5), which a column directly on `users` could not
-express. `roles` and `permissions` also stay global: they are a fixed,
-platform-defined catalog shared by every company (PROJECT_PLAN.md section
-3.5), not something each company customizes.
-
-Foreign keys to `organizations.id` / `projects.id` use RESTRICT, matching
-this file's existing convention (see Postmortem.incident_id) of defaulting
-to RESTRICT so deleting a company can never silently cascade-delete its
-incident/audit history -- that has to be a deliberate, separate operation,
-not a side effect.
-
-Requires the pgcrypto extension (for gen_random_uuid()) -- enabled in the
-first Alembic migration, not here.
-"""
-
 import uuid
 from datetime import datetime
 
@@ -82,9 +49,9 @@ class Role(Base):
     """A named role, e.g. `engineer` or `incident_commander`.
 
     A fixed, platform-wide catalog shared by every company -- not customer-
-    editable in the MVP (PROJECT_PLAN.md section 3.5). Grants zero or more
-    `Permission`s via `RolePermission`; assigned to a user *within one
-    company* via `UserRole`.
+    editable in the MVP. Grants zero or more
+    `Permission`s via `RolePermission`; assigned to a user within one
+    company via `UserRole`.
     """
 
     __tablename__ = "roles"
@@ -163,13 +130,11 @@ class Incident(Base):
     """A single incident record -- the transactional heart of `core/`.
 
     Now carries both `organization_id` (which company) and `project_id`
-    (which team within that company) -- per PROJECT_PLAN.md section 3.2,
-    every incident belongs to exactly one project, even for small companies
+    (which team within that company) --  every incident belongs to exactly one project, even for small companies
     that never bother creating more than the auto-created default one.
 
     Indexes are re-shaped so `organization_id` leads every composite index:
-    every real query filters by company first (PROJECT_PLAN.md section 3.7 --
-    tenant isolation is enforced at the query level, not applied afterward),
+    every real query filters by company first  isolation is enforced at the query level, not applied afterward),
     so a leading `organization_id` column serves both "just this company" and
     "this company plus a status/severity/recency filter" queries without
     needing a separate single-column index as well.
@@ -314,7 +279,7 @@ class AuditLog(Base):
     write an audit row with no company attached. Every audit event core/
     currently produces (incident.create, postmortem.approve, etc.) *is*
     company-scoped, so this may end up NOT NULL once that question is
-    settled -- see PROJECT_PLAN.md section 12.7 for the related open item.
+    settled -- see for the related open item.
     """
 
     __tablename__ = "audit_logs"

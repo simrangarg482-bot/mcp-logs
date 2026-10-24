@@ -1,46 +1,13 @@
-"""Pydantic contracts for core/tenancy.
-
-Owned by: core/tenancy. Local to this submodule (PROJECT_STRUCTURE.md: types
-specific to one submodule live in its own schemas.py; only genuinely shared
-types live in shared/schemas/). Read models map from the ORM rows defined in
-database/models/tenancy_models.py via `from_attributes=True`, so a service can
-build one directly from a row (`Organization.model_validate(row)`) without a
-manual field-by-field copy -- same pattern as core/audit/schemas.py and
-core/users/schemas.py.
-
-Scope (PROJECT_PLAN.md section 9.2): organizations, projects, SSO
-configuration, and connector configuration. Deliberately excluded, even
-though their ORM models live in the same tenancy_models.py file:
-  - `ExternalIdentityMapping` -- resolving an IdP subject claim to a user is
-    core/auth's federation-lookup concern (PROJECT_PLAN.md section 3.3), not
-    tenancy's.
-  - `ProjectMembership` -- project-scoped role assignment is core/users's
-    RBAC concern (PROJECT_PLAN.md section 3.6), consistent with the boundary
-    already drawn when Identity/core.users were made organization-scoped
-    (ENGINEERING_DECISIONS.md #004).
-
-Secrets discipline (PROJECT_PLAN.md section 12.5): `client_secret_ref` and
-`ConnectorConfig.credential_ref` below are references/identifiers into an
-encrypted secret store, never a usable raw credential -- core/tenancy stores
-and returns only the reference, consistent with its "must never do the
-actual OAuth handshake" boundary (PROJECT_PLAN.md section 9.2). It is
-therefore safe for these read models to include them. The one deliberate
-exception is `ConnectorConfigCreate.credential_ref` (below) -- a caller
-registering a new connector still submits the *plaintext* credential once,
-at setup time; `core.tenancy.service.register_connector` envelope-encrypts
-it (`app.shared.security`) before it is ever persisted, so by the time it
-comes back out through `ConnectorConfig.credential_ref` it is the encrypted
-envelope, not what was submitted.
-
-`AccessRuleCreate`/`InvitationCreate`/`ProvisioningDecision` back the SSO
-provisioning-policy design (ENGINEERING_DECISIONS.md's provisioning-policy
-entry): "who may join this organization" is core/tenancy's responsibility,
-distinct from core/auth (verifies authentication only) and core/users
-(creates users / manages roles once provisioning has already been decided).
-`grants_role` on the two Create schemas is a role *name* (e.g. `"engineer"`),
-not a raw `grants_role_id` -- resolving a name to an id is the service
-layer's job (via core/users's role lookup), so callers of this module's
-public interface never need to already know a role's UUID.
+"""This module defines the Pydantic schemas for EKIP's organizations, projects, SSO 
+settings, and connector configurations. Schemas can be created directly from database 
+rows using `from_attributes=True`, avoiding manual field copying. Authentication 
+identity mapping belongs to `core/auth`, while project memberships and role assignments 
+belong to `core/users`, keeping responsibilities separate. For security, stored 
+credentials are represented by encrypted-secret references rather than raw secrets; 
+when a connector is registered, its submitted plaintext credential is encrypted before 
+being saved. Finally, invitation and access-rule schemas define who can join an 
+organization, while `grants_role` uses a readable role name such as `"engineer"` instead 
+of requiring callers to know the role's database UUID.
 """
 
 from __future__ import annotations
@@ -97,8 +64,8 @@ class OrganizationCreate(BaseModel):
     """Request body for `create_organization`.
 
     `slug` is constrained to URL-safe lowercase segments since it's used
-    directly in the per-organization login URL (PROJECT_PLAN.md section 3.3:
-    `https://app.ekip.io/o/{org-slug}/login`) -- validating its shape here,
+    directly in the per-organization login URL:
+    `https://app.ekip.io/o/{org-slug}/login` -- validating its shape here,
     once, means every caller (onboarding UI, admin API) gets the same rule
     rather than re-implementing it.
     """
@@ -127,7 +94,7 @@ class ProjectCreate(BaseModel):
     """Request body for `create_project`.
 
     `is_default` marks the auto-created "General" project every organization
-    gets at onboarding time (PROJECT_PLAN.md section 3.2) -- callers creating
+    gets at onboarding time -- callers creating
     additional, explicitly-scoped projects should leave this `False`.
     """
 
@@ -152,16 +119,12 @@ class Project(BaseModel):
 
 
 class SSOConfigurationCreate(BaseModel):
-    """Request body for configuring (or replacing) an organization's SSO.
-
-    All four supported providers speak OIDC (PROJECT_PLAN.md section 3.3), so
-    `protocol` defaults to `"oidc"` and one shape covers all of them; `saml`
-    is accepted here as a forward-compatible option for a future SAML-only
-    IdP, not because any current provider needs it. `client_secret_ref` is
-    expected to already be a valid reference into the encrypted secret store
-    (PROJECT_PLAN.md section 12.5) -- creating that secret record is a
-    `shared/security` concern, not something this schema or core/tenancy
-    performs.
+    """This schema defines the request body for setting up or replacing an organization's 
+    SSO configuration. The protocol defaults to OIDC, which all four currently supported 
+    providers use; `saml` is accepted for possible future support. The 
+    `client_secret_ref` must already point to a secret stored in the encrypted secret 
+    store. Creating and encrypting that secret is handled by `shared/security`, not this 
+    schema or `core/tenancy`.
     """
 
     provider: SSOProvider
@@ -174,7 +137,7 @@ class SSOConfigurationCreate(BaseModel):
 class SSOConfiguration(BaseModel):
     """An organization's SSO federation settings, as returned by the read
     surface. `core/auth` reads this to determine which IdP to redirect an
-    employee to (PROJECT_PLAN.md section 3.3, step 2).
+    employee to.
     """
 
     model_config = ConfigDict(from_attributes=True, frozen=True)
@@ -197,11 +160,9 @@ class ConnectorConfigCreate(BaseModel):
     """Request body for `register_connector`.
 
     `project_id` is optional: a connector can be organization-wide (e.g. one
-    GitHub org covering every team) or scoped to a single project
-    (PROJECT_PLAN.md section 3.2). `config` holds source-specific settings
+    GitHub org covering every team) or scoped to a single project . `config` holds source-specific settings
     (which Slack workspace, which repos) whose shape genuinely differs per
-    source -- left as a free-form mapping for the same EAV-style reason
-    `document_metadata` is, per DATABASE_DESIGN.md.
+    source.
     """
 
     source: ConnectorSource
@@ -212,7 +173,7 @@ class ConnectorConfigCreate(BaseModel):
 
 class ConnectorConfig(BaseModel):
     """One (organization, external tool) connection, as returned by the read
-    surface -- backs `list_connectors` (PROJECT_PLAN.md section 9.2).
+    surface -- backs `list_connectors`.
     """
 
     model_config = ConfigDict(from_attributes=True, frozen=True)
@@ -243,8 +204,7 @@ IngestionRunStatus = Literal["queued", "running", "succeeded", "failed", "dead_l
 
 class IngestionRun(BaseModel):
     """One ingestion run (full or incremental sync) of a `ConnectorConfig`,
-    as returned by the read surface (`GET /tenancy/connectors/{id}/runs`,
-    Phase 2D).
+    as returned by the read surface (`GET /tenancy/connectors/{id}/runs`).
 
     Deliberately a distinct type from `app.ingestion.schemas.IngestionJob`
     (which this mirrors field-for-field) rather than that type reused
@@ -279,13 +239,11 @@ class IngestionRun(BaseModel):
 
 class IngestionJobStats(BaseModel):
     """Aggregated ingestion-run metrics for one connector, over some
-    organization and time window (Phase 5.6) -- the `ingestion_jobs`-side
+    organization and time window -- the `ingestion_jobs`-side
     counterpart to `app.agents.schemas.AgentExecutionStats`/`core.
     observability.schemas.McpToolStats`. Backs `GET /observability/
     ingestion`, filling the one observability gap those two dashboards
-    didn't already cover (see `docs/operations/rbac-audit-phase-4.7.md`-
-    adjacent Phase 5 investigation: ingestion had no aggregate dashboard at
-    all before this).
+    didn't already cover.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -371,7 +329,7 @@ class Invitation(BaseModel):
     """A pending, accepted, expired, or revoked invitation, as returned by
     the read surface.
 
-    `token` (Phase 7.5) is populated ONLY in `create_invitation`'s own
+    `token` is populated ONLY in `create_invitation`'s own
     response -- the one moment the raw, single-use token exists in memory at
     all. `model_validate(row)` elsewhere (`list_invitations`,
     `revoke_invitation`) leaves it `None` by construction: the ORM row has

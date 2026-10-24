@@ -1,34 +1,10 @@
-"""Persistence for core/knowledge -- the proposal/review lifecycle over the
-`documents` table (`app.database.models.ingestion_models.Document`,
-`DocumentMetadata`).
-
-Owned by: core/knowledge, for this lifecycle only. This is a deliberate,
-flagged extension of `DATABASE_DESIGN.md`'s per-table single-writer
-convention, not an oversight: that convention otherwise assigns `documents`
-writes exclusively to `app.ingestion` (its connector-sync pipeline). This
-module writes a disjoint code path instead -- every row it creates has
-`source="manual"`, which `app.ingestion`'s connectors never produce and
-never read -- so there is no real write conflict, only two legitimate
-writers of the same table for two genuinely different reasons (automated
-sync vs. human/agent-proposed content). `core/knowledge` cannot route
-through `app.ingestion.repository`'s existing functions either way
-(pyproject.toml's "core does not depend on mcp or ingestion" contract
-forbids `core/` from importing `app.ingestion` at all), so issuing its own
-queries directly against the shared ORM models is the only available
-option, not a shortcut chosen over a cleaner one. This mirrors the
-precedent `retrieval/` already set for *reading* this same table directly
-(see `retrieval.schemas.ScoredChunk`'s docstring) -- extended here, for the
-first time, to a second table *writer*.
-
-`documents` has no dedicated `content` column: the model was shaped only to
-identify/dedupe *ingested* content (`Document`'s own docstring), never to
-store a manually-authored body. Rather than a schema migration -- out of
-scope for wiring up an MCP tool, and this project's sandbox has no live
-database to author/verify one against -- a proposed document's full text is
-stored as a `document_metadata` row under the key `"content"`, reusing the
-existing EAV table for a fact it wasn't originally shaped for. Flagged here
-plainly: a dedicated `documents.content` column is the more correct
-long-term fix, once a real migration can be written and tested.
+"""This module handles saving and reviewing proposed knowledge documents using the 
+existing `documents` and `document_metadata` tables. Unlike ingestion, which saves 
+automatically synced content, `core/knowledge` saves manually proposed content 
+(`source="manual"`), so the two workflows remain separate. Since the `documents` table 
+has no content field, the full document text is temporarily stored in `document_metadata` 
+under the key `"content"`. A dedicated `documents.content` column is the recommended 
+long-term solution.
 """
 
 from __future__ import annotations
@@ -136,19 +112,10 @@ async def list_proposed_documents(
     limit: int = 50,
     offset: int = 0,
 ) -> Sequence[Document]:
-    """Return every non-deleted, still-proposed, human/agent-authored
-    document for `organization_id`, newest first (API_DESIGN.md:
-    `GET /knowledge/proposed`).
-
-    `source == "manual"` (Stage 2 of the Knowledge/Knowledge Gaps review):
-    this is the review queue for `propose_document`/`propose_runbook_update`
-    proposals specifically, not for connector-synced content. Bulk ingestion
-    (`app.ingestion.repository.insert_document`) now defaults every row it
-    writes to `status="published"` (Stage 1), so in practice no non-`manual`
-    row should ever reach `status="proposed"` -- this filter is defense in
-    depth, guaranteeing this queue is correct by construction even if a
-    future connector regression ever wrote `status="proposed"` again,
-    rather than relying solely on ingestion always getting that right.
+    """It gets all documents that are waiting for review in an organization, showing the 
+    newest first. It only includes documents manually suggested by a person or AI, and 
+    skips deleted documents. Automatically imported documents are excluded, even if a 
+    future bug accidentally marks them as waiting for review.
     """
     stmt = (
         select(Document)
@@ -186,8 +153,7 @@ async def list_published_documents(
     anyone in the organization, with no `knowledge:review` gate -- this is a
     browsing surface for already-approved content, not the review queue.
 
-    `limit`/`offset` (Stage 3 of the Knowledge/Knowledge Gaps review, same
-    defaults/bounds as `list_proposed_documents`): before Stage 1 made
+    `limit`/`offset` before Stage 1 made
     ingested documents reach `status="published"` at all, this query always
     returned an empty or near-empty set, so being unbounded was harmless.
     Stage 1 made it return every ingested document in the organization in
@@ -234,8 +200,7 @@ async def update_document_title(
 
     Used by `service.update_document` (human-review editing, PATCH). Bumping
     `version` here mirrors `Document`'s own docstring convention for content
-    changes (DATABASE_DESIGN.md: a changed-content re-ingest gets an
-    incremented `version` rather than silently overwriting history) -- an
+    changes -- an
     edited title/content during review is the same kind of "this document's
     content just changed" fact, just produced by a human reviewer instead of
     a re-ingest.

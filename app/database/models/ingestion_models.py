@@ -1,42 +1,3 @@
-"""SQLAlchemy models for tables owned by ingestion/.
-
-Owned by: database/ (definition) + ingestion/ (write access) -- same
-ownership discipline as core_models.py and tenancy_models.py: only
-ingestion/'s repository code writes here; every other module reads through
-ingestion/'s public interface (`run_ingestion_job`, `reindex`,
-`get_job_status`, PROJECT_PLAN.md section 9.8), never by importing these
-models directly.
-
-Tables here match DATABASE_DESIGN.md's "ingestion/ -- owned tables" section
-(`ingestion_jobs`, `documents`, `document_metadata`), adapted for
-multi-tenancy per PROJECT_PLAN.md section 3.2, plus one deliberate shape
-change beyond "add organization_id/project_id" that is worth calling out
-rather than silently making:
-
-`ingestion_jobs` no longer has its own `source`/`source_config` columns.
-DATABASE_DESIGN.md defined those before `connector_configs` existed (that
-table is core/tenancy's, added in the multi-tenancy migration); a job now
-carries `connector_config_id` instead, since `connector_configs.source` and
-`connector_configs.config` already hold exactly that information for the
-connector the job is running. This isn't optional cosmetics: PROJECT_PLAN.md
-section 9.8 states ingestion's public API as literally
-`run_ingestion_job(connector_config_id)`, which only makes sense if a job is
-modeled as "one run of a given connector_config", not as a free-floating
-`(source, source_config)` pair a caller could invent independently of any
-registered connector. `organization_id` is still carried directly on the job
-row (not derived solely via a join) for the same RLS/defense-in-depth reason
-`IncidentTimeline`/`Postmortem` do in core_models.py.
-
-Foreign keys to `documents.id` use CASCADE where the child row is meaningless
-without its parent (`document_metadata`, matching DATABASE_DESIGN.md's
-original definition exactly); foreign keys to `organizations.id`/`projects.id`
-use RESTRICT, matching core_models.py's content-table convention (a
-company's ingested documents and job history must not silently vanish as a
-side effect of an unrelated delete) rather than tenancy_models.py's CASCADE
-convention (which applies to tenancy's own org-owned config rows, a
-different category of data).
-"""
-
 import uuid
 from datetime import datetime
 
@@ -104,33 +65,19 @@ class IngestionJob(Base):
 
 
 class Document(Base):
-    """One ingested unit of content (a Slack thread, a GitHub file, etc.),
-    normalized and deduplicated across re-ingestion.
-
-    `project_id` is NOT NULL -- matching `core_models.Incident`'s convention
-    (PROJECT_PLAN.md section 3.2, every tenant-owned record belongs to
-    exactly one project, defaulting to the organization's auto-created
-    default project when its source connector is org-wide rather than
-    project-scoped; that fallback is a service-layer decision, not modeled
-    here). `status` distinguishes agent-proposed documentation from
-    human-reviewed content (ARCHITECTURE.md section 5's human-review gate) --
-    reuses `shared.schemas.DocumentStatus` rather than redefining the
-    vocabulary locally.
-
-    Unique constraint mirrors DATABASE_DESIGN.md's original idempotency key
-    with `organization_id` added to the tuple (PROJECT_PLAN.md section 4.6):
+    """Unique constraint mirrors DATABASE_DESIGN.md's original idempotency key
+    with `organization_id` added to the tuple
     `(organization_id, source, external_id, content_hash)`. A re-ingest with
     an unchanged hash conflicts harmlessly (upsert no-op); changed content
     gets a new row with `version` incremented, per DATABASE_DESIGN.md, rather
     than overwriting history.
 
-    `acl_permission_code` is the document-level ACL gate from PROJECT_PLAN.md
-    section 5.4, per ENGINEERING_DECISIONS.md #007: nullable, reusing the
+    `acl_permission_code` is the document-level ACL gate from nullable, reusing the
     existing RBAC permission-code vocabulary rather than a separate grant
     table. `NULL` (the default) means no restriction beyond tenant/project
     scope. Nothing in ingestion populates this to a non-null value yet --
     see #007's flagged tradeoff -- the column exists so retrieval's hard
-    filter (Milestone 5) has something real to enforce against.
+    filter has something real to enforce against.
     """
 
     __tablename__ = "documents"

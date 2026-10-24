@@ -1,10 +1,7 @@
-"""Persistence for core/audit -- the only module that writes `audit_logs`.
-
-Owned by: core/audit. Pure data access: functions here take an AsyncSession,
+"""Owned by: core/audit. Pure data access: functions here take an AsyncSession,
 issue exactly one statement, and return ORM rows (or None). They never commit,
 never map to Pydantic, and never enforce business rules -- that is the
-service's job (ARCHITECTURE.md section 3: infrastructure/persistence holds no
-business logic).
+service's job.
 
 Append-only by contract (DATABASE_DESIGN.md): this module exposes only INSERT
 and SELECT. No update/delete function exists, so the append-only guarantee is

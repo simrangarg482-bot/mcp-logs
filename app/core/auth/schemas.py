@@ -267,8 +267,8 @@ class TokenClaims(BaseModel):
 
 class VerifiedIdPClaims(BaseModel):
     """The verified claims extracted from an IdP's ID token, once
-    `_exchange_code_for_claims` has actually completed signature
-    verification (see that function's NOT YET IMPLEMENTED docstring).
+    `_exchange_code_for_claims` has completed signature and configured
+    issuer/audience/expiry verification.
 
     Distinct from `TokenClaims` (EKIP's own access token claims): this is
     what the *IdP* asserts about the user -- subject, email, display name,

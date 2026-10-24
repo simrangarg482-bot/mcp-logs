@@ -136,67 +136,13 @@ class Settings(BaseSettings):
         ),
     )
 
-    # --- Agent behavior (AGENT_WORKFLOWS.md 2.2) ---------------------------
-    # `default=0.5` as of 2026-09-02 (was 0.6). PROVISIONAL -- a projection,
-    # not a fresh sweep. Background:
-    #
-    # The 2026-08-13 `scripts/eval_confidence.py` run against `test-org`'s
-    # live corpus (36 questions: 14 clear-answer / 12 ambiguous / 10
-    # no-information; scripts/eval_confidence_report.json) measured the OLD
-    # confidence signals. It found:
-    #   - Sweeping 0.40-0.80, 0.40 scored marginally higher on F1 (0.700 vs
-    #     0.6's 0.667) -- a 0.033 margin on 36 questions, within one question
-    #     flipping category by chance, so not acted on at the time.
-    #   - 2 of 14 clear-answer questions misrouted to investigation at 0.6
-    #     (confidence 0.422 and 0.454) -- both single-source questions.
-    #   - clear-answer (0.422-1.000) and ambiguous (0.572-1.000) confidence
-    #     ranges overlapped: `top_similarity`/`rerank_score` measured topical
-    #     relevance, not whether the specific fact asked was present. No
-    #     threshold separates those two -- a signal-quality gap, not a
-    #     threshold-tuning one.
-    #   - no-information clustered tightly at ~0.389, well clear of the gate.
-    #
-    # `app/agents/confidence.py` was then changed (EKIP audit findings 1
-    # and 2): `source_count` no longer scores a single-source answer at 0.2
-    # (diminishing-returns curve, 1 source -> 0.70), and `top_similarity` is
-    # now the top dense cosine similarity, not a near-constant ~0.5 fused-RRF
-    # artifact. Working the weighted formula through with those signals and
-    # the 2026-08-13 per-category behavior projects: no-information ~0.17
-    # (far below any sane gate), the two former misroutes back above ~0.55,
-    # clear-answer strong ~0.85, ambiguous still ~0.80 and still overlapping
-    # clear-answer (that signal-quality gap is unchanged). 0.5 sits below
-    # the weakest projected genuine clear-answer and well above
-    # no-information; going lower mostly just raises the
-    # confidently-wrong-answer (false-positive) rate without rescuing more
-    # clear-answer questions. Exact per-question values depend on
-    # cross-encoder logits this projection had to estimate -- hence
-    # provisional.
-    #
-    # CONFIRM THIS: re-run
-    # `scripts/eval_confidence.py --compare-to scripts/eval_confidence_report.json`
-    # against live `test-org` data, check its per-category regression output,
-    # set this from that sweep, and replace this comment with the run's date
-    # and findings. scripts/eval_confidence_report.json is stale until then.
-    #
-    # RE-CONFIRMED, 2026-09-05 calibration review (docs/PROJECT_STATUS.md
-    # Phase 27): still not empirically calibrated. Live evaluation remains
-    # blocked in every environment tried so far (no live test-org database +
-    # funded OPENAI_API_KEY available) -- this review did not fabricate a
-    # number to fill that gap. Also confirmed: every existing checked-in
-    # scripts/eval_confidence_report*.json predates BOTH the 2026-08-30
-    # reranker calibration and the 2026-09-02 signal-shape rewrite
-    # (app/agents/confidence.py's own module docstring) -- those reports
-    # measured a since-replaced scoring formula, so they are not valid
-    # evidence for this default even setting aside their small sample size
-    # (n=14, below app.evaluation.semantic.calibration's 20-example floor).
-    # This value (0.5) is an honest placeholder, not a validated one.
     confidence_threshold: float = Field(
         default=0.5,
         ge=0.0,
         le=1.0,
     )
 
-    # --- AI cost budget enforcement (Phase 6.6, app.agents.cost_budget) ----
+    # --- AI cost budget enforcement 
     max_organization_cost_usd_per_day: float | None = Field(
         default=None,
         gt=0.0,

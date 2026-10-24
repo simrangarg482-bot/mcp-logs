@@ -1,72 +1,12 @@
-"""SQLAlchemy models for tables owned by retrieval/ -- one `<collection>_chunks`
-table per content category (DATABASE_DESIGN.md), pgvector-backed.
-
-Owned by: database/ (definition) + retrieval/ (write access) -- same
-ownership discipline as every other models file in this project: only
-retrieval/'s repository code writes here.
-
-Three concrete tables (`documentation_chunks`, `code_chunks`,
-`conversations_chunks`), not one generic `chunks` table with a `collection`
-discriminator column: DATABASE_DESIGN.md's per-collection convention exists
-precisely so each collection can independently choose pgvector vs. Qdrant as
-its backend (PROJECT_PLAN.md section 8.4) -- a single shared table would
-make that per-collection choice inexpressible at the schema level.
-`_ChunkColumns` factors out the identical column set so the three concrete
-classes don't duplicate it field-by-field.
-
-Collections map 1:1 onto the `ContentType` classification ingestion's
-processing pipeline already produces
-(`app.ingestion.processors.chunking.ContentType`: `"code"`/`"chat"`/
-`"document"`/`"incident"`): `code_chunks` <- `"code"`, `conversations_chunks`
-<- `"chat"` (this table's name for it), `documentation_chunks` <-
-`"document"` (ditto), `incidents_chunks` <- `"incident"`, matching
-PROJECT_PLAN.md section 8.2's naming ("documentation, incidents, code,
-conversations").
-
-`incidents_chunks` closes the gap this docstring used to flag here (no
-`incidents` collection, nothing in core/incidents producing embeddable
-chunks): `app.ingestion.connectors.incidents.IncidentsConnector` re-ingests
-each organization's incidents through the ordinary ingestion pipeline --
-the same "core-domain data, re-ingested as searchable content" pattern its
-sibling `RunbooksConnector` already established for postmortems -- rather
-than a bespoke embedding path bolted onto `core.incidents.service`. Its
-embedding text is title + description + resolution (an approved/published
-postmortem's `root_cause`, when one exists; see that connector's own
-docstring for why resolution is optional, never mandatory, to index an
-incident). `IncidentChunk` uses the same `_ChunkColumns` mixin as every
-other collection here -- NOT `_RepoScopedChunkColumns`: an incident has no
-GitHub repo to scope by, the same reason `ConversationChunk` omits
-`repo_full_name`.
-
-Every chunk carries `organization_id`, `project_id`, and `acl_permission_code`
-directly (not just `document_id`, requiring a join) -- PROJECT_PLAN.md
-sections 5.4-5.5 require these as hard query-time filters, and denormalizing
-them here matches the same "carry the tenant columns directly, for RLS/query
-filtering" convention already used for `IncidentTimeline`, `Postmortem`,
-`IngestionJob` in this codebase.
-
-Embedding dimension (384) and model choice are pinned in
-ENGINEERING_DECISIONS.md #006 -- changing either later means a migration on
-every table below (`VECTOR(N)` is fixed width per column).
-
-Requires the `vector` Postgres extension (`CREATE EXTENSION IF NOT EXISTS
-vector;`) to be enabled before these tables can be created -- the same
-"enabled in the first Alembic migration, not here" treatment
-`core_models.py`'s docstring already gives `pgcrypto`. Neon supports the
-`vector` extension natively; it just needs enabling once per database.
-
-`content_tsv` backs the lexical half of hybrid search (PROJECT_PLAN.md
-section 5.2: "dense retrieval with BM25 (lexical/keyword) retrieval, merged
-via reciprocal rank fusion"). Honest naming note: this is Postgres's own
-full-text search (`to_tsvector`/`ts_rank_cd`), not literally the BM25
-algorithm -- reusing the existing Postgres instance (the same "simplest to
-stand up first" reasoning Milestone 5 already applies to choosing pgvector
-over Qdrant) rather than adding a dedicated search engine or a separate BM25
-library. A `GENERATED ALWAYS AS (...) STORED` column, not computed inline
-per query: makes the GIN index below usable (Postgres can't index an
-expression it has to recompute per-row per-query), and keeps the tsvector
-automatically in sync with `content` with no application code responsible
-for updating it.
+"""Tenant security: Every chunk stores organization_id, project_id, and 
+acl_permission_code directly, allowing retrieval to filter results by organization, 
+project, and document permissions.
+Incident search: Incidents enter the normal ingestion pipeline and become searchable 
+chunks, rather than using a separate embedding system.
+Hybrid search: content_tsv supports PostgreSQL full-text keyword search, while 
+embeddings support semantic search. Results can be combined to improve retrieval.
+Automatic indexing: content_tsv is a stored generated column that stays synchronized 
+with the chunk's content and supports a GIN index for efficient text search.
 """
 
 import uuid

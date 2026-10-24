@@ -1,33 +1,9 @@
-"""Public interface for core/tenancy -- organizations, projects, SSO
-configuration, connector configuration.
-
-Owned by: core/tenancy. This module is the authority on "what organization/
-project does this belong to, and what's connected to it" (PROJECT_PLAN.md
-section 9.2). Business rules and ORM->Pydantic mapping live here; raw SQL
-lives in repository.py; the wire/HTTP concerns live in the future api/ layer.
-
-Tenant isolation (PROJECT_PLAN.md section 3.7): every function below that
-takes an `organization_id` argument also takes the calling `actor: Identity`
-and verifies `actor.organization_id == organization_id` before doing anything
-else -- there is no operation here that lets an authenticated caller read or
-write another organization's tenancy data, matching the "no admin override
-query path that skips it" rule. `create_organization` is the sole exception,
-since an organization does not exist yet at the moment it is being created --
-see its docstring.
-
-Authorization: mutating operations (`create_project`, `register_connector`,
-`configure_sso`) additionally require the `tenancy:manage` permission via
-core/users's `require_permission`, and record an audit event via
-core/audit's `record_audit_event` -- the same cross-submodule dependency
-pattern documented for core/incidents (PROJECT_PLAN.md section 9.4). Seeding
-`tenancy:manage` into the platform's fixed permission catalog is a data
-migration concern, not something this module manages.
-
-Milestone 10 addition (PROJECT_PLAN.md section 12.5): `register_connector`
-now depends on `shared/security` to envelope-encrypt a connector's plaintext
-credential before persisting it -- the first real caller of that module.
-See `register_connector`'s own docstring for the encrypt-at-write/decrypt-
-at-read split with `ingestion.service`.
+"""This manages EKIP's organizations, projects, SSO, and connector settings. 
+It checks that users can access only their own organization's data and requires the 
+`tenancy:manage` permission for changes. Changes are also recorded in audit logs. 
+When a connector is registered, its password or token is encrypted before being stored. 
+In short, `core/tenancy` manages organization settings, enforces access rules, and keeps 
+connected services' credentials secure.
 """
 
 from __future__ import annotations
@@ -95,7 +71,7 @@ _DEFAULT_INVITATION_LIFETIME = timedelta(days=14)
 
 def _ensure_same_organization(actor: Identity, organization_id: uuid.UUID) -> None:
     """Tenant-isolation guard: deny any operation scoped to an organization
-    other than the caller's own (PROJECT_PLAN.md section 3.7).
+    other than the caller's own.
 
     Deliberately a `PermissionDeniedError`, not a `NotFoundError` -- consistent
     with `core.users.service.require_permission`'s existing convention for
@@ -156,9 +132,9 @@ async def create_organization(
     `PermissionDeniedError` `require_permission` raises everywhere else.
 
     Auto-creates the "General" default project in the same transaction
-    (PROJECT_PLAN.md section 3.2: every organization has at least one project,
+    every organization has at least one project,
     so every incident/document has a uniform `project_id` even for customers
-    who never create a second one).
+    who never create a second one.
 
     Raises ConflictError if `data.slug` is already taken. Note: this is a
     pre-check, not a database-constraint-driven retry -- a race between two
@@ -1185,36 +1161,14 @@ async def evaluate_provisioning(
     email: str,
     groups: Sequence[str] = (),
 ) -> ProvisioningDecision:
-    """Decide whether a verified SSO login may provision a user in
-    `organization_id`, and which role it should receive if so.
-
-    No `actor` parameter: this runs mid-login, before any session/Identity
-    exists yet (same precedent as `get_organization_sso_config`) -- it is
-    core/auth's job to call this, never the reverse, keeping "is this
-    authentication valid" and "is this login authorized to provision an
-    account" as two distinct steps (this migration's whole point).
-
-    Precedence, most to least specific:
-      1. A pending, unexpired invitation for this exact `email`.
-      2. An active `domain` rule matching the email's domain.
-      3. An active `group` rule matching one of `groups` (only checked if the
-         IdP actually sent a groups claim -- an empty `groups` sequence
-         means "no group claim available," not "matches no group," and
-         group rules are simply skipped rather than treated as a denial
-         signal on their own).
-      4. Otherwise, denied.
-
-    Milestone 10 RLS note: unlike `get_organization_sso_config`, this
-    function is *handed* `organization_id` directly by its caller (core/auth,
-    which resolved it via `get_organization_sso_config`'s own slug lookup
-    earlier in the same login transaction) rather than discovering it itself
-    -- so the GUC is set unconditionally at the top, before the first
-    RLS-protected query (`invitations`) runs. Since `set_tenant_context` uses
-    `SET LOCAL` (transaction-scoped, not connection-scoped), and SSO login
-    completion runs `get_organization_sso_config` -> `evaluate_provisioning`
-    -> `accept_invitation` inside one shared transaction, this same call also
-    covers `accept_invitation`'s later `invitations` update on this session
-    -- no separate wiring needed there.
+    """This function decides whether someone logging in through SSO is allowed to join 
+    an organization and which role they should get. It checks in this order: (1) a valid 
+    invitation for their email, (2) an active rule matching their email domain, (3) an 
+    active rule matching their identity provider's groups, if group information is 
+    available. If none match, access is denied. It runs before login finishes, so it 
+    doesn't need an existing user identity. It also sets the organization context before 
+    querying protected database tables, allowing Row-Level Security (RLS) to work 
+    correctly.
     """
     await set_tenant_context(session, organization_id)
     now = datetime.now(timezone.utc)

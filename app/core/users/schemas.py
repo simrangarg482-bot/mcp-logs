@@ -1,15 +1,10 @@
-"""Pydantic contracts for core/users.
-
-Local to the users submodule (PROJECT_STRUCTURE.md). `Permission` and `Role`
-map directly from their ORM rows; `UserProfile` is an aggregate the service
-composes from a user row plus its role/permission joins, so it is built
-explicitly rather than validated from a single ORM object.
-
-Note the relationship to `shared.schemas.Identity`: `Identity` is the compact,
-security-focused object threaded through *every* call (kind + permission set);
-`UserProfile` is the richer, human-facing representation returned by user-
-management / "who am I" endpoints. They are intentionally distinct -- one is
-for authorization checks, the other for display and administration.
+"""This module defines the Pydantic schemas for `core/users`. `Permission` and `Role` are 
+created directly from their database ORM objects, while `UserProfile` is built by 
+combining a user record with its roles and permissions. The key difference is that 
+`Identity` is a small, security-focused object used to check permissions during every 
+request, whereas `UserProfile` contains richer user information for display and 
+user-management endpoints. They serve different purposes: authorization versus display 
+and administration.
 """
 
 from __future__ import annotations
@@ -61,10 +56,8 @@ class UserProfile(BaseModel):
 
 class OrganizationMember(BaseModel):
     """One user's membership summary within a single organization -- the
-    read surface backing `GET /organizations/{id}/members` (Phase 2's fix
-    for the previously-nonexistent `GET /users` the frontend's Users
-    settings page called). Deliberately not `UserProfile`: this is a listing
-    of *other* users seen by an admin, not "my own resolved access," so it
+    read surface backing `GET /organizations/{id}/members` Deliberately not `UserProfile`: this is a listing
+    of other users seen by an admin, not "my own resolved access," so it
     carries `roles` only (never a flattened `permissions` set for someone
     else's account) and omits anything password/credential-adjacent.
     """
@@ -80,11 +73,10 @@ class OrganizationMember(BaseModel):
 
 
 class UserCredentialLookup(BaseModel):
-    """The minimum a caller verifying a *password* credential needs -- not a
+    """The minimum a caller verifying a password credential needs -- not a
     full `User` row.
 
-    Exists so `core.auth.service` (which owns hashing/verification -- see
-    that module's docstring, "core/auth verifies authentication") can check a
+    Exists so `core.auth.service` (which owns hashing/verification "core/auth verifies authentication") can check a
     password without core/users handing another module a raw ORM row, or
     core/auth reaching into `core.users.repository` directly (breaking the
     "call the owning layer's service.py, never its repository.py" convention

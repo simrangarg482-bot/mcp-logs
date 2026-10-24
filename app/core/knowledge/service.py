@@ -1,28 +1,12 @@
-"""Public interface for core/knowledge -- the proposed-document review
-lifecycle (API_DESIGN.md section 1 "Knowledge review queue", section 3's
-`propose_runbook_update` tool and `document://` resource).
-
-This is the core-owned "documents" read/write surface that
-`app.mcp.tools`'s and `app.mcp.resources`'s own module docstrings flagged as
-missing when Milestone 8 was first wired up -- closing it unblocks
-`propose_runbook_update`, the `document://` resource, and the REST
-knowledge-review endpoints all at once, and is also the exact surface the
-future Knowledge Gap Agent will need (its entire output is this same kind
-of document proposal, AGENT_WORKFLOWS.md section 2.6).
-
-Tenant isolation follows the same `_ensure_same_organization` /
-`_get_owned_*` convention already used in `core.incidents.service` /
-`core.tenancy.service` / `core.audit.service`.
-
-Permission design: `propose_document` is deliberately NOT gated by a
-special permission code -- recording a low-risk, fully reversible proposal
-awaiting human review is the same category as
-`core.incidents.service.record_investigation_result` (a system/agent-
-recorded fact, not itself a privileged action). `publish_document`,
-`reject_document`, and `list_proposed_documents` ARE gated by
-`knowledge:review`, since those are the actual human-approval-gate actions
-`ARCHITECTURE.md` section 5 requires ("nothing an agent proposes reaches
-'knowledge' without this").
+"""This module defines the document proposal and review system for EKIP. Agents can use 
+`propose_document` to suggest runbook or knowledge-document updates, which remain pending 
+until a human reviews them. Humans use `publish_document` to approve and publish 
+proposals or `reject_document` to reject them, while `list_proposed_documents` retrieves 
+pending proposals. Proposing a document does not require special permission because it is
+reversible and awaits review, but the review-related operations require `knowledge:review` 
+permission. All operations must respect tenant isolation, ensuring users can access only 
+documents belonging to their organization. This interface supports the MCP tool, the 
+`document://` resource, REST endpoints, and the future Knowledge Gap Agent.
 """
 
 from __future__ import annotations
@@ -257,7 +241,7 @@ async def list_published_documents(
     that a published document is readable by anyone in the organization, so
     this is a plain org-scoped read, not a review-queue action.
 
-    `limit`/`offset` (Stage 3): threaded straight through to
+    `limit`/`offset`: threaded straight through to
     `repository.list_published_documents` -- see that function's own
     docstring for why this became necessary.
     """

@@ -1,21 +1,11 @@
-"""Persistence for core/users -- users, roles, permissions.
-
-Owned by: core/users. Pure data access: each function issues one query and
-returns ORM rows or plain scalar values; identity assembly and authorization
-decisions live in service.py.
-
-The two resolution queries (`get_role_names`, `get_permission_codes`) are the
-performance-relevant heart of RBAC: they let the service resolve an identity
-in two small indexed queries once per request, so every downstream
-`authorize()` is then a pure in-memory set check with no further DB hits.
-
-Multi-tenancy (PROJECT_PLAN.md section 3.5): role assignment is scoped per
-organization -- `UserRole`'s primary key is `(user_id, organization_id,
-role_id)`, not just `(user_id, role_id)`, because the same person can hold
-different roles in different companies. Both resolution queries below filter
-by `organization_id` as well as `user_id` accordingly: omitting that filter
-would resolve (and leak) a user's roles/permissions across every organization
-they belong to, not just the one their session is scoped to.
+"""This module handles database access for users, roles, and permissions. Each function 
+performs a query and returns data, while `service.py` handles identity creation and 
+authorization decisions. The key optimization is that `get_role_names` and 
+`get_permission_codes` fetch the required information in just two indexed queries, 
+allowing later permission checks to happen in memory without additional database calls. 
+For multi-tenancy, both queries filter by `user_id` and `organization_id`, ensuring a 
+user's roles and permissions are resolved only for the current organization, preventing 
+cross-company permission leaks.
 """
 
 from __future__ import annotations
@@ -35,23 +25,8 @@ from app.database.models.core_models import (
 )
 from app.database.models.tenancy_models import Project, ProjectMembership
 
-#: Every permission code a self-service signup's bootstrap "admin" role
-#: grants -- the same fixed list `scripts/seed_test_organization.py`'s
-#: dev-only bootstrap has always used (kept in sync by hand; both exist to
-#: grant "everything this app currently checks," not a design each should
-#: independently decide). Not a `Settings` field: this is what "admin"
-#: *means* in this codebase today, not a deployment-time configuration.
-#:
-#: `incident:read` was missing here from 2026-08-18 (`d706a360fc2a`, which
-#: added the permission and backfilled every role that existed at the time)
-#: until this fix -- `scripts/seed_test_organization.py` was updated with it
-#: then (see its own "one exception" comment) but this list was not, so
-#: every organization's admin role created by real self-service signup in
-#: that window could write incidents but not read them. `ensure_admin_role`
-#: (core/users/service.py) re-grants this list to the single shared "admin"
-#: role on every signup, so restoring the code here self-heals every
-#: existing organization the next time anyone signs up; migration
-#: `f3e7c05b146e` grants it immediately without waiting for that.
+# Defines the fixed permission list granted to the admin role during signup.
+
 ADMIN_PERMISSION_CODES: Sequence[str] = (
     "tenancy:manage",
     "incident:read",
@@ -123,8 +98,8 @@ async def list_organization_members(
 async def get_role_names(
     session: AsyncSession, user_id: uuid.UUID, organization_id: uuid.UUID
 ) -> Sequence[str]:
-    """Return the names of the roles assigned to `user_id` *within
-    `organization_id`*.
+    """Return the names of the roles assigned to `user_id` within
+    `organization_id`.
 
     Joins `user_roles -> roles`, filtered by both `user_id` and
     `organization_id` -- a role assignment held in a different organization
@@ -162,7 +137,7 @@ async def insert_user(session: AsyncSession, *, email: str, display_name: str) -
 async def get_role_by_name(session: AsyncSession, name: str) -> Role | None:
     """Fetch a single role by its unique name, or None if absent.
 
-    Used by core/tenancy to resolve a role *name* (e.g. `"engineer"`, as
+    Used by core/tenancy to resolve a role name (e.g. `"engineer"`, as
     supplied in an `AccessRuleCreate`/`InvitationCreate` request) into the
     `grants_role_id` actually stored -- a read-only reference-data lookup, not
     a tenant-scoped query, since the `roles` catalog itself is global
@@ -234,29 +209,9 @@ async def get_permission_codes(
 async def get_project_permission_map(
     session: AsyncSession, user_id: uuid.UUID, organization_id: uuid.UUID
 ) -> dict[uuid.UUID, frozenset[str]]:
-    """Return `user_id`'s permission codes, grouped by project, for every
-    project *within `organization_id`* they hold a `project_memberships` row
-    for (PROJECT_PLAN.md section 3.6's project-level authorization tier --
-    `Identity.project_permissions`).
 
-    Joins `project_memberships -> projects -> role_permissions -> permissions`,
-    filtered by `user_id` and `projects.organization_id` (not
-    `project_memberships.organization_id` -- that column doesn't exist;
-    `project_memberships` has no organization_id of its own, only a
-    `project_id`, so scoping to this organization has to go through
-    `projects` the same way `core.tenancy.service.register_connector`
-    already validates a submitted `project_id` against its owning
-    organization). A project the user has no membership row for is simply
-    absent from the returned dict -- `Identity.has_permission`'s own
-    docstring already treats "no entry for this project" as "fall back to
-    org-level `permissions`", so there is no need to return an empty
-    frozenset placeholder for every project in the organization.
+    """Return a user's permission codes grouped by project within an organization."""
 
-    One query, grouped in Python rather than issued once per project: this
-    mirrors `get_permission_codes`'s single-query-per-identity-resolution
-    shape, so populating `Identity.project_permissions` in `resolve_identity`
-    costs exactly one more indexed query, not N.
-    """
     stmt = (
         select(ProjectMembership.project_id, Permission.code)
         .join(Project, Project.id == ProjectMembership.project_id)
@@ -291,31 +246,13 @@ async def update_password_hash(session: AsyncSession, *, user_id: uuid.UUID, pas
 
 
 async def get_first_organization_id(session: AsyncSession, user_id: uuid.UUID) -> uuid.UUID | None:
-    """Return one organization `user_id` holds a role in, or `None` if they
-    hold none anywhere.
+    """Return an organization where the user has a role, or None if they have none.
+Used during password login when the user's organization is not yet known.
+Because Row-Level Security blocks normal queries before tenant context exists,
+it uses a dedicated SQL function to safely resolve the organization. Signup
+currently assigns each password-auth user exactly one organization role.
+"""
 
-    Used by `core.auth.service.login_with_password`, the same "no Identity/
-    org context yet" bootstrap shape as `core.auth.repository.
-    resolve_refresh_token_organization_id`: a password login starts from a
-    bare `user_id` with no organization known yet, and `user_roles` is one of
-    `c7d4e8f19a2b`'s `FORCE ROW LEVEL SECURITY` tables -- an ordinary
-    `SELECT` here would return nothing under a connection role that actually
-    enforces RLS (unlike the `neondb_owner`/`BYPASSRLS` connection every
-    environment has used so far), since no tenant context can exist at this
-    point in the flow. Goes through the narrow `resolve_user_first_
-    organization` SQL function (`c5e2a9f4d7b3_resolve_user_first_
-    organization_function.py`) for exactly that reason, rather than a plain
-    ORM query against `UserRole` -- the same pattern `resolve_refresh_token_
-    organization_id` already established for the identical problem on
-    `refresh_tokens`.
-
-    A password-auth account is created by `signup` with exactly one role
-    assignment (in the organization signup itself created), so "first" is
-    unambiguous today -- this does not attempt to support a password-auth
-    user who has since joined a second organization some other way, which
-    isn't a flow this codebase builds yet (see `core.auth.service.signup`'s
-    own docstring).
-    """
     result = await session.execute(
         text("SELECT resolve_user_first_organization(:user_id)"),
         {"user_id": str(user_id)},

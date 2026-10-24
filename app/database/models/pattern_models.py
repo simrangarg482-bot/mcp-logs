@@ -1,39 +1,14 @@
-"""SQLAlchemy models for `proactive_findings`/`proactive_finding_evidence` --
-the derived pattern-detection layer (Priority 6).
-
-Owned by: database/ (definition) + core/proactive (write access).
-
-WHAT THIS IS, AND IS NOT
-    A `ProactiveFinding` is a derived INTERPRETATION of real source data
-    (e.g. "3 high/critical incidents in this project in the last 14 days"),
-    never a copy of that data. It carries no incident description, no
-    document text -- only a deterministic title/summary generated from
-    structured fields, plus references (`ProactiveFindingEvidence`) to the
-    real rows that support it. Reading an evidence entity's actual content
-    remains the job of the service that already owns it
-    (`core.incidents`/`core.knowledge`), through that service's own
-    authorization -- exactly the same non-duplication discipline
-    `knowledge_graph_edges` (Priority 5) already established.
-
-WHY THIS IS A SEPARATE TABLE FROM `knowledge_graph_edges`, NOT MORE EDGES
-    `core.graph.contract.ProvenanceType` is deliberately `"foreign_key"` /
-    `"deterministic_extraction"` / `"manual"` -- there is no `"inferred"`/
-    `"pattern"` value, and that absence is a documented design decision
-    (nothing in that module infers anything). A proactive finding IS an
-    inference (over real, deterministic, structured signals -- never an
-    LLM), so storing it as a graph edge would mean fabricating a provenance
-    kind the graph contract explicitly does not support. Findings and their
-    evidence get their own table instead of stretching that contract to fit
-    a shape it was not designed for.
-
-NO FOREIGN KEY ON `ProactiveFindingEvidence.entity_id`
-    Same polymorphic tradeoff `knowledge_graph_edges.source_entity_id`/
-    `audit_logs.resource_id` already make -- one column cannot reference
-    both `incidents` and `documents`. The consequence is handled the same
-    way: `core.proactive.service` always re-resolves an evidence row's
-    entity against its own source table (and re-applies that entity type's
-    existing authorization rule) before it can appear in a response, never
-    trusting an evidence row alone.
+"""These two tables help EKIP detect patterns in incidents and show the real records 
+that support them.
+- proactive_findings stores a detected pattern, for example: “3 high-severity incidents 
+occurred in this project in the last 14 days.”
+- proactive_finding_evidence stores references to the incidents or documents supporting
+ that finding, not copies of their content.
+Why separate from knowledge_graph_edges? A graph edge represents a relationship between
+ entities. A proactive finding is an interpretation of multiple records, so it has its own tables.
+Why no foreign key on entity_id? It can refer to different entity types, such as 
+incidents or documents. EKIP checks that each referenced record still exists and that 
+the user has permission to access it before showing it.
 """
 
 import uuid
@@ -47,7 +22,7 @@ from app.database.session import Base
 
 
 class ProactiveFinding(Base):
-    """One derived, evidence-backed pattern (Priority 6)."""
+    """One derived, evidence-backed pattern."""
 
     __tablename__ = "proactive_findings"
     __table_args__ = (

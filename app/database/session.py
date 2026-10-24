@@ -28,37 +28,18 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, Query
 
 from app.shared.config.logging import get_logger
 from app.shared.config.settings import get_settings
 
 logger = get_logger(__name__)
 
-# The Postgres GUC every Milestone 10 RLS policy checks against (see
-# app/database/migrations/versions/c7d4e8f19a2b_milestone_10_row_level_security.py).
-# Named here, not just there, since this module is the one place that ever
-# sets it.
+
 _TENANT_GUC_NAME = "app.current_organization_id"
 
-# Query parameters libpq-style clients (psql, psycopg) understand but
-# asyncpg's connect() does not -- SQLAlchemy's asyncpg dialect forwards every
-# URL query parameter straight through as a keyword argument to
-# asyncpg.connect(), so an unrecognized one raises a bare
-# `TypeError: connect() got an unexpected keyword argument '...'` rather than
-# a clear connection error. Neon's default copy-paste connection string
-# includes `sslmode`/`channel_binding` by default; `.env.example` has long
-# used the `ssl=` spelling. TLS itself is still applied -- via `connect_args`
-# in `_build_engine`, using the `ssl` keyword asyncpg actually accepts, with
-# its value derived from these same parameters by `_ssl_connect_arg` below.
 _UNSUPPORTED_ASYNCPG_QUERY_PARAMS = {"sslmode", "channel_binding", "ssl"}
 
-# `sslmode`/`ssl` values that select a plaintext connection. Everything else
-# (including an omitted parameter) keeps TLS on: every managed provider this
-# project has targeted requires it, so the secure default must survive a
-# missing parameter. Railway's private network is the one place TLS is turned
-# off on purpose -- traffic never leaves the project's internal network and
-# the stock Postgres image serves no certificate -- via `?sslmode=disable`.
 _SSL_DISABLED_VALUES = {"disable", "disabled", "false", "0", "off", "no"}
 
 
@@ -106,15 +87,6 @@ class Base(DeclarativeBase):
     """
 
 
-# Phase 6.1: bounds how long any single query/statement may run once a
-# connection is established -- asyncpg's own `command_timeout`, distinct
-# from the connection-establishment timeout (asyncpg's own `connect()`
-# default, 60s, already bounded independently of this codebase). Without
-# this, a hung/slow query (a lock wait, a runaway analytical query) had no
-# application-level bound at all. 30s matches the flat timeout every
-# ingestion connector already uses (`httpx.AsyncClient(..., timeout=30.0)`)
-# -- generous for this application's normal OLTP-shaped queries, not
-# generous enough to let a truly stuck connection hold a pool slot forever.
 _COMMAND_TIMEOUT_SECONDS = 30.0
 # Recycle pooled connections after 30 minutes -- `pool_pre_ping=True`
 # already tests a connection is alive before handing it out, but does not
@@ -129,23 +101,11 @@ def _build_engine(database_url: str | None = None) -> AsyncEngine:
     """Create an async engine from settings, or from `database_url` when
     given explicitly.
 
-    A function rather than a module-level constant so tests can call it
-    again after monkeypatching `Settings.database_url` (via
-    `get_settings.cache_clear()`), consistent with the pattern already
-    established in settings.py.
+    Optional database URL override for this call, used by migrations to connect
+    with the privileged migration role instead of the least-privileged runtime
+    role. Ensures online migrations use `Settings.migration_database_url` rather
+    than reusing the shared runtime engine."""
 
-    `database_url` (optional): overrides `settings.database_url` for this
-    call only -- added for `app.database.migrations.base.run_migrations_
-    online`, which needs an engine built from `Settings.migration_
-    database_url` (the admin/migration role) instead of the shared runtime
-    engine below (built from `Settings.database_url`, the least-privileged
-    `ekip_app` role). Before this parameter existed, `run_migrations_online`
-    always reused the module-level `engine` object regardless of
-    `migration_database_url` -- that setting only ever affected Alembic's
-    `--sql` (offline) mode, never a real `alembic upgrade head`, silently
-    defeating the migration/runtime role split for every deployment
-    topology, not only Railway.
-    """
     settings = get_settings()
     url = database_url if database_url is not None else str(settings.database_url)
     return create_async_engine(
@@ -217,37 +177,13 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def set_tenant_context(session: AsyncSession, organization_id: uuid.UUID) -> None:
-    """Set the session-local GUC every Milestone 10 RLS policy checks
-    (`app.current_organization_id`) for the remainder of the *current
-    transaction only*.
+    """Sets the current organization ID for RLS policies for the current
+       transaction only. Uses a bound parameter for safety and clears the
+       tenant context on commit or rollback to prevent it leaking across
+       requests that reuse pooled database connections.
 
-    Uses `set_config(name, value, is_local=true)` rather than a literal
-    `SET LOCAL app.current_organization_id = '<uuid>'` string -- `SET` is not
-    a regular SQL statement and does not accept bind parameters, so building
-    it via string interpolation would be the one place in this codebase
-    doing that; `set_config` is an ordinary function call and takes a normal
-    bound parameter instead. The third argument, `true`, is what makes this
-    "local" (scoped to the current transaction, cleared on commit/rollback)
-    rather than "session" (would otherwise leak forward to whatever the next
-    request/job on this pooled connection happens to be, since sessions
-    aren't guaranteed to map 1:1 to connections).
-
-    Callers, in the order Identity/org context becomes known in this
-    codebase: `app.api.deps.get_current_identity` (REST, every request),
-    `app.mcp.auth.resolve_mcp_identity` (MCP, every call),
-    `app.core.tenancy.service.evaluate_provisioning` and
-    `get_organization_sso_config` (pre-Identity, login-flow paths that
-    resolve `organization_id` themselves before any token exists), and
-    `app.agents.workers.tasks`'s scheduled Knowledge Gap scan (each
-    per-organization iteration, using the `organization_id` the scan loop
-    already holds). `app.ingestion.service._execute_ingestion_job` is the
-    one exception that cannot call this first -- seeing this module's own
-    docstring and that function's docstring for why it resolves the org id
-    via a narrow RLS-bypassing lookup before it can call this at all.
-
-    Must be called on every session before any RLS-protected table is
-    queried on it -- a session that never calls this sees zero rows from
-    every such table (fail-closed; see the RLS migration's own docstring).
+       Must be called before querying any RLS-protected table. If omitted,
+       RLS blocks access to protected rows by default.
     """
     await session.execute(
         text("SELECT set_config(:guc_name, :org_id, true)"),
@@ -258,7 +194,7 @@ async def set_tenant_context(session: AsyncSession, organization_id: uuid.UUID) 
 @asynccontextmanager
 async def session_scope() -> AsyncGenerator[AsyncSession, None]:
     """Context-manager equivalent of `get_db_session` for non-request
-    contexts -- arq job handlers (ENGINEERING_DECISIONS.md #002), the
+    contexts -- arq job handlers, the
     Knowledge Gap Agent's scheduled graph, CLI scripts, etc. -- anywhere
     FastAPI's `Depends` isn't available.
 
